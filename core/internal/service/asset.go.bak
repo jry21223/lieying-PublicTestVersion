@@ -1,0 +1,570 @@
+package service
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"github.com/kunlun-sec/lunying/internal/repository"
+)
+
+type AssetService struct {
+	assetRepo *repository.AssetRepository
+}
+
+func NewAssetService(assetRepo *repository.AssetRepository) *AssetService {
+	return &AssetService{
+		assetRepo: assetRepo,
+	}
+}
+
+// CalculateImportance 计算资产重要性（攻击价值分数）
+func (s *AssetService) CalculateImportance(asset *models.Asset) int {
+	score := 0
+
+	switch asset.Type {
+	case "web_application":
+		score += 30
+	case "service":
+		score += 20
+	case "port":
+		score += 15
+	case "ip":
+		score += 10
+	case "subdomain":
+		score += 8
+	case "domain":
+		score += 5
+	}
+
+	if asset.Extra != "" {
+		var extra map[string]interface{}
+		if err := json.Unmarshal([]byte(asset.Extra), &extra); err == nil {
+			if vulns, ok := extra["vulnerabilities"].([]interface{}); ok && len(vulns) > 0 {
+				score += 20
+			}
+
+			if cms, ok := extra["cms"].(string); ok && cms != "" {
+				score += 10
+			}
+
+			if hasLogin, ok := extra["has_login"].(bool); ok && hasLogin {
+				score += 15
+			}
+		}
+	}
+
+	if strings.Contains(asset.Value, "admin") ||
+		strings.Contains(asset.Value, "api") ||
+		strings.Contains(asset.Value, "dev") ||
+		strings.Contains(asset.Value, "test") {
+		score += 15
+	}
+
+	if asset.Type == "port" {
+		highRiskPorts := map[int]bool{
+			21: true, 22: true, 23: true, 3389: true,
+			3306: true, 5432: true, 1433: true, 27017: true,
+			6379: true, 9200: true, 9300: true, 11211: true,
+		}
+
+		var portNum int
+		if asset.Extra != "" {
+			var extra map[string]interface{}
+			if err := json.Unmarshal([]byte(asset.Extra), &extra); err == nil {
+				if port, ok := extra["port"].(float64); ok {
+					portNum = int(port)
+				}
+			}
+		}
+
+		if highRiskPorts[portNum] {
+			score += 10
+		}
+	}
+
+	if score > 100 {
+		score = 100
+	}
+	if score < 0 {
+		score = 0
+	}
+
+	return score
+}
+
+// CreateAsset 创建资产并自动计算重要性
+func (s *AssetService) CreateAsset(asset *models.Asset) error {
+	asset.Importance = s.CalculateImportance(asset)
+	now := time.Now()
+	asset.FirstSeen = &now
+	asset.LastSeen = &now
+	return s.assetRepo.Create(asset)
+}
+
+// CreateDomainAsset 创建域名资产
+func (s *AssetService) CreateDomainAsset(targetID uuid.UUID, domain string, parentID *uuid.UUID) (*models.Asset, error) {
+	existing, _ := s.assetRepo.GetByValue(targetID, domain)
+	if existing != nil {
+		return existing, nil
+	}
+
+	asset := &models.Asset{
+		TargetID: targetID,
+		Type:     "domain",
+		Name:     domain,
+		Value:    domain,
+		ParentID: parentID,
+		Status:   "active",
+	}
+
+	if err := s.CreateAsset(asset); err != nil {
+		return nil, err
+	}
+
+	return asset, nil
+}
+
+// CreateSubdomainAsset 创建子域名资产并自动解析IP
+func (s *AssetService) CreateSubdomainAsset(targetID uuid.UUID, subdomain string, parentID *uuid.UUID) (*models.Asset, error) {
+	existing, _ := s.assetRepo.GetByValue(targetID, subdomain)
+	if existing != nil {
+		return existing, nil
+	}
+
+	asset := &models.Asset{
+		TargetID: targetID,
+		Type:     "subdomain",
+		Name:     subdomain,
+		Value:    subdomain,
+		ParentID: parentID,
+		Status:   "active",
+	}
+
+	ips, err := net.LookupIP(subdomain)
+	if err == nil && len(ips) > 0 {
+		ipList := []string{}
+		for _, ip := range ips {
+			if ipv4 := ip.To4(); ipv4 != nil {
+				ipList = append(ipList, ipv4.String())
+			}
+		}
+
+		if len(ipList) > 0 {
+			extra := map[string]interface{}{
+				"ip_addresses": ipList,
+			}
+			extraBytes, _ := json.Marshal(extra)
+			asset.Extra = string(extraBytes)
+
+			for _, ip := range ipList {
+				ipAsset, err := s.CreateIPAsset(targetID, ip, &asset.ID)
+				if err != nil {
+					fmt.Printf("创建IP资产失败: %v\n", err)
+				} else {
+					s.CreateAssetRelation(asset.ID, ipAsset.ID, "resolves_to", "DNS解析")
+				}
+			}
+		}
+	}
+
+	if err := s.CreateAsset(asset); err != nil {
+		return nil, err
+	}
+
+	return asset, nil
+}
+
+// CreateIPAsset 创建IP资产
+func (s *AssetService) CreateIPAsset(targetID uuid.UUID, ip string, parentID *uuid.UUID) (*models.Asset, error) {
+	existing, _ := s.assetRepo.GetByValue(targetID, ip)
+	if existing != nil {
+		return existing, nil
+	}
+
+	asset := &models.Asset{
+		TargetID: targetID,
+		Type:     "ip",
+		Name:     ip,
+		Value:    ip,
+		ParentID: parentID,
+		Status:   "active",
+	}
+
+	if err := s.CreateAsset(asset); err != nil {
+		return nil, err
+	}
+
+	return asset, nil
+}
+
+// CreatePortAsset 创建端口资产并关联到IP
+func (s *AssetService) CreatePortAsset(targetID uuid.UUID, ip string, port int, protocol string, service string, parentID *uuid.UUID) (*models.Asset, error) {
+	value := fmt.Sprintf("%s:%d", ip, port)
+	existing, _ := s.assetRepo.GetByValue(targetID, value)
+	if existing != nil {
+		return existing, nil
+	}
+
+	name := fmt.Sprintf("%d/%s", port, protocol)
+	if service != "" {
+		name = fmt.Sprintf("%d/%s (%s)", port, protocol, service)
+	}
+
+	extra := map[string]interface{}{
+		"port":     port,
+		"protocol": protocol,
+		"service":  service,
+	}
+	extraBytes, _ := json.Marshal(extra)
+
+	asset := &models.Asset{
+		TargetID: targetID,
+		Type:     "port",
+		Name:     name,
+		Value:    value,
+		ParentID: parentID,
+		Extra:    string(extraBytes),
+		Status:   "active",
+	}
+
+	if err := s.CreateAsset(asset); err != nil {
+		return nil, err
+	}
+
+	if service != "" {
+		serviceAsset, err := s.CreateServiceAsset(targetID, service, "", &asset.ID)
+		if err == nil {
+			s.CreateAssetRelation(asset.ID, serviceAsset.ID, "runs", "服务")
+		}
+	}
+
+	return asset, nil
+}
+
+// CreateServiceAsset 创建服务资产
+func (s *AssetService) CreateServiceAsset(targetID uuid.UUID, service string, version string, parentID *uuid.UUID) (*models.Asset, error) {
+	value := fmt.Sprintf("%s:%s", service, parentID.String())
+	existing, _ := s.assetRepo.GetByValue(targetID, value)
+	if existing != nil {
+		return existing, nil
+	}
+
+	name := service
+	if version != "" {
+		name = fmt.Sprintf("%s %s", service, version)
+	}
+
+	extra := map[string]interface{}{
+		"service": service,
+		"version": version,
+	}
+	extraBytes, _ := json.Marshal(extra)
+
+	asset := &models.Asset{
+		TargetID: targetID,
+		Type:     "service",
+		Name:     name,
+		Value:    value,
+		ParentID: parentID,
+		Extra:    string(extraBytes),
+		Status:   "active",
+	}
+
+	if err := s.CreateAsset(asset); err != nil {
+		return nil, err
+	}
+
+	return asset, nil
+}
+
+// CreateWebAsset 创建Web应用资产
+func (s *AssetService) CreateWebAsset(targetID uuid.UUID, url string, cms string, cmsVersion string, techStack []string, parentID *uuid.UUID) (*models.Asset, error) {
+	existing, _ := s.assetRepo.GetByValue(targetID, url)
+	if existing != nil {
+		return existing, nil
+	}
+
+	extra := map[string]interface{}{
+		"url":        url,
+		"cms":        cms,
+		"cmsVersion": cmsVersion,
+		"techStack":  techStack,
+	}
+	extraBytes, _ := json.Marshal(extra)
+
+	asset := &models.Asset{
+		TargetID: targetID,
+		Type:     "web_application",
+		Name:     url,
+		Value:    url,
+		ParentID: parentID,
+		Extra:    string(extraBytes),
+		Status:   "active",
+	}
+
+	if err := s.CreateAsset(asset); err != nil {
+		return nil, err
+	}
+
+	return asset, nil
+}
+
+// CreateAssetRelation 创建资产关联
+func (s *AssetService) CreateAssetRelation(fromID, toID uuid.UUID, relationType string, description string) error {
+	relation := &models.AssetRelation{
+		FromAssetID:  fromID,
+		ToAssetID:    toID,
+		RelationType: relationType,
+		Description:  description,
+	}
+	return s.assetRepo.CreateRelation(relation)
+}
+
+// DetectChanges 检测资产变化
+func (s *AssetService) DetectChanges(targetID uuid.UUID, currentAssets []*models.Asset) ([]*models.AttackSurfaceChange, error) {
+	existingAssets, err := s.assetRepo.GetByTargetID(targetID)
+	if err != nil {
+		return nil, err
+	}
+
+	existingMap := make(map[string]*models.Asset)
+	for _, asset := range existingAssets {
+		existingMap[asset.Value] = asset
+	}
+
+	currentMap := make(map[string]*models.Asset)
+	for _, asset := range currentAssets {
+		currentMap[asset.Value] = asset
+	}
+
+	changes := []*models.AttackSurfaceChange{}
+
+	for value, asset := range currentMap {
+		if _, exists := existingMap[value]; !exists {
+			change := &models.AttackSurfaceChange{
+				TargetID:     targetID,
+				ChangeType:   "new",
+				AssetID:      &asset.ID,
+				AssetType:    asset.Type,
+				AssetValue:   asset.Value,
+				AssetName:    asset.Name,
+				DetectedAt:   time.Now(),
+				Importance:   asset.Importance,
+			}
+			if err := s.assetRepo.CreateChange(change); err == nil {
+				changes = append(changes, change)
+			}
+		} else {
+			s.assetRepo.UpdateLastSeen(asset.ID)
+		}
+	}
+
+	for value, asset := range existingMap {
+		if _, exists := currentMap[value]; !exists {
+			change := &models.AttackSurfaceChange{
+				TargetID:     targetID,
+				ChangeType:   "gone",
+				AssetID:      &asset.ID,
+				AssetType:    asset.Type,
+				AssetValue:   asset.Value,
+				AssetName:    asset.Name,
+				DetectedAt:   time.Now(),
+				Importance:   asset.Importance,
+			}
+			if err := s.assetRepo.CreateChange(change); err == nil {
+				changes = append(changes, change)
+			}
+		}
+	}
+
+	return changes, nil
+}
+
+// GetAssetTree 获取资产树
+func (s *AssetService) GetAssetTree(targetID uuid.UUID) ([]*models.Asset, error) {
+	return s.assetRepo.GetRootAssets(targetID)
+}
+
+// GetAssetStats 获取资产统计
+func (s *AssetService) GetAssetStats(targetID uuid.UUID) (map[string]interface{}, error) {
+	count, err := s.assetRepo.Count(targetID)
+	if err != nil {
+		return nil, err
+	}
+
+	countByType, err := s.assetRepo.CountByType(targetID)
+	if err != nil {
+		return nil, err
+	}
+
+	highValueAssets, err := s.assetRepo.GetHighValueAssets(targetID)
+	if err != nil {
+		return nil, err
+	}
+
+	changes, err := s.assetRepo.GetUnreviewedChanges(targetID)
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]interface{}{
+		"total":            count,
+		"by_type":          countByType,
+		"high_value_count": len(highValueAssets),
+		"new_changes":      len(changes),
+	}, nil
+}
+
+// UpdateAssetImportance 更新资产重要性
+func (s *AssetService) UpdateAssetImportance(assetID uuid.UUID) error {
+	asset, err := s.assetRepo.GetByID(assetID)
+	if err != nil {
+		return err
+	}
+
+	asset.Importance = s.CalculateImportance(asset)
+	return s.assetRepo.Update(asset)
+}
+
+// AddTags 添加标签到资产
+func (s *AssetService) AddTags(assetID uuid.UUID, tags []string) error {
+	asset, err := s.assetRepo.GetByID(assetID)
+	if err != nil {
+		return err
+	}
+
+	existingTags := []string{}
+	if asset.Tags != "" {
+		json.Unmarshal([]byte(asset.Tags), &existingTags)
+	}
+
+	tagMap := make(map[string]bool)
+	for _, tag := range existingTags {
+		tagMap[tag] = true
+	}
+	for _, tag := range tags {
+		tagMap[tag] = true
+	}
+
+	newTags := []string{}
+	for tag := range tagMap {
+		newTags = append(newTags, tag)
+	}
+
+	tagsBytes, _ := json.Marshal(newTags)
+	asset.Tags = string(tagsBytes)
+
+	return s.assetRepo.Update(asset)
+}
+
+// RemoveTags 移除资产标签
+func (s *AssetService) RemoveTags(assetID uuid.UUID, tags []string) error {
+	asset, err := s.assetRepo.GetByID(assetID)
+	if err != nil {
+		return err
+	}
+
+	existingTags := []string{}
+	if asset.Tags != "" {
+		json.Unmarshal([]byte(asset.Tags), &existingTags)
+	}
+
+	tagMap := make(map[string]bool)
+	for _, tag := range existingTags {
+		tagMap[tag] = true
+	}
+	for _, tag := range tags {
+		delete(tagMap, tag)
+	}
+
+	newTags := []string{}
+	for tag := range tagMap {
+		newTags = append(newTags, tag)
+	}
+
+	tagsBytes, _ := json.Marshal(newTags)
+	asset.Tags = string(tagsBytes)
+
+	return s.assetRepo.Update(asset)
+}
+
+// ExportToJSON 导出资产为JSON
+func (s *AssetService) ExportToJSON(targetID uuid.UUID) (string, error) {
+	assets, err := s.assetRepo.GetByTargetID(targetID)
+	if err != nil {
+		return "", err
+	}
+
+	data, err := json.MarshalIndent(assets, "", "  ")
+	if err != nil {
+		return "", err
+	}
+
+	return string(data), nil
+}
+
+// GetTopologyData 获取拓扑图数据
+func (s *AssetService) GetTopologyData(targetID uuid.UUID) (map[string]interface{}, error) {
+	assets, err := s.assetRepo.GetByTargetID(targetID)
+	if err != nil {
+		return nil, err
+	}
+
+	nodes := []map[string]interface{}{}
+	edges := []map[string]interface{}{}
+
+	colorMap := map[string]string{
+		"domain":          "#3b82f6",
+		"subdomain":       "#60a5fa",
+		"ip":              "#10b981",
+		"port":            "#f59e0b",
+		"service":         "#ef4444",
+		"web_application": "#8b5cf6",
+	}
+
+	for _, asset := range assets {
+		color := colorMap[asset.Type]
+		if color == "" {
+			color = "#6b7280"
+		}
+
+		nodes = append(nodes, map[string]interface{}{
+			"data": map[string]interface{}{
+				"id":    asset.ID.String(),
+				"label": asset.Name,
+				"type":  asset.Type,
+				"color": color,
+			},
+		})
+
+		if asset.ParentID != nil {
+			edges = append(edges, map[string]interface{}{
+				"data": map[string]interface{}{
+					"source": asset.ParentID.String(),
+					"target": asset.ID.String(),
+				},
+			})
+		}
+	}
+
+	relations, _ := s.assetRepo.GetRelations(assets[0].ID)
+	for _, rel := range relations {
+		edges = append(edges, map[string]interface{}{
+			"data": map[string]interface{}{
+				"source": rel.FromAssetID.String(),
+				"target": rel.ToAssetID.String(),
+				"label":  rel.RelationType,
+			},
+		})
+	}
+
+	return map[string]interface{}{
+		"nodes": nodes,
+		"edges": edges,
+	}, nil
+}

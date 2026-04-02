@@ -1,0 +1,501 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/logger"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"github.com/kunlun-sec/lunying/internal/repository"
+	"github.com/kunlun-sec/lunying/internal/service"
+)
+
+type ReconToolsHandler struct {
+	toolService       *service.ToolService
+	toolRepo          *repository.ToolRepository
+	workflowRepo      *repository.WorkflowRepository
+	workflowExecRepo  *repository.WorkflowExecutionRepository
+	toolExecRepo      *repository.ToolExecutionRepository
+	workflowEngine    *service.WorkflowEngine
+}
+
+func NewReconToolsHandler(
+	toolService *service.ToolService,
+	toolRepo *repository.ToolRepository,
+	workflowRepo *repository.WorkflowRepository,
+	workflowExecRepo *repository.WorkflowExecutionRepository,
+	toolExecRepo *repository.ToolExecutionRepository,
+	workflowEngine *service.WorkflowEngine,
+) *ReconToolsHandler {
+	return &ReconToolsHandler{
+		toolService:      toolService,
+		toolRepo:         toolRepo,
+		workflowRepo:     workflowRepo,
+		workflowExecRepo: workflowExecRepo,
+		toolExecRepo:     toolExecRepo,
+		workflowEngine:   workflowEngine,
+	}
+}
+
+func (h *ReconToolsHandler) RegisterRoutes(r chi.Router) {
+	r.Route("/api/recon", func(r chi.Router) {
+		r.Route("/tools", func(r chi.Router) {
+			r.Get("/", h.handleListTools)
+			r.Get("/{id}", h.handleGetTool)
+			r.Post("/{id}/check-install", h.handleCheckToolInstall)
+		})
+
+		r.Route("/workflows", func(r chi.Router) {
+			r.Get("/", h.handleListWorkflows)
+			r.Post("/", h.handleCreateWorkflow)
+			r.Get("/templates", h.handleListWorkflowTemplates)
+			r.Get("/{id}", h.handleGetWorkflow)
+			r.Put("/{id}", h.handleUpdateWorkflow)
+			r.Delete("/{id}", h.handleDeleteWorkflow)
+			r.Post("/{id}/execute", h.handleExecuteWorkflow)
+		})
+
+		r.Route("/executions", func(r chi.Router) {
+			r.Get("/workflow/{id}", h.handleGetWorkflowExecution)
+			r.Get("/workflow/{id}/tools", h.handleListToolExecutions)
+		})
+
+		r.Route("/datasources", func(r chi.Router) {
+			r.Get("/", h.handleListDataSources)
+			r.Post("/", h.handleCreateDataSource)
+			r.Put("/{id}", h.handleUpdateDataSource)
+			r.Delete("/{id}", h.handleDeleteDataSource)
+		})
+	})
+}
+
+func (h *ReconToolsHandler) handleListTools(w http.ResponseWriter, r *http.Request) {
+	category := r.URL.Query().Get("category")
+
+	var tools []*models.Tool
+	var err error
+
+	if category != "" {
+		tools, err = h.toolRepo.ListByCategory(category)
+	} else {
+		tools, err = h.toolRepo.List()
+	}
+
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "获取工具列表失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"tools": tools,
+	})
+}
+
+func (h *ReconToolsHandler) handleGetTool(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的工具ID")
+		return
+	}
+
+	tool, err := h.toolRepo.GetByID(id)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "工具未找到")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, tool)
+}
+
+func (h *ReconToolsHandler) handleCheckToolInstall(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的工具ID")
+		return
+	}
+
+	if err := h.toolService.UpdateInstallationStatus(id); err != nil {
+		respondError(w, http.StatusInternalServerError, "检查工具安装状态失败: "+err.Error())
+		return
+	}
+
+	tool, err := h.toolRepo.GetByID(id)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "工具未找到")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, tool)
+}
+
+func (h *ReconToolsHandler) handleListWorkflows(w http.ResponseWriter, r *http.Request) {
+	workflows, err := h.workflowRepo.List()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "获取工作流列表失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"workflows": workflows,
+	})
+}
+
+func (h *ReconToolsHandler) handleListWorkflowTemplates(w http.ResponseWriter, r *http.Request) {
+	workflows, err := h.workflowRepo.ListTemplates()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "获取工作流模板失败: "+err.Error())
+		return
+	}
+
+	if len(workflows) == 0 {
+		wf, err := h.workflowEngine.CreateDefaultWorkflow(
+			"一键全收集",
+			"完整的信息收集流程：子域名枚举 -> 端口扫描 -> 指纹识别",
+		)
+		if err == nil {
+			workflows = append(workflows, wf)
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"templates": workflows,
+	})
+}
+
+func (h *ReconToolsHandler) handleCreateWorkflow(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		Nodes       json.RawMessage `json:"nodes"`
+		Edges       json.RawMessage `json:"edges"`
+		IsTemplate  bool            `json:"is_template"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "无效的请求参数")
+		return
+	}
+
+	workflow := &models.Workflow{
+		ID:          uuid.New(),
+		Name:        req.Name,
+		Description: req.Description,
+		Nodes:       string(req.Nodes),
+		Edges:       string(req.Edges),
+		IsTemplate:  req.IsTemplate,
+	}
+
+	if err := h.workflowRepo.Create(workflow); err != nil {
+		respondError(w, http.StatusInternalServerError, "创建工作流失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusCreated, workflow)
+}
+
+func (h *ReconToolsHandler) handleGetWorkflow(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的工作流ID")
+		return
+	}
+
+	workflow, err := h.workflowRepo.GetByID(id)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "工作流未找到")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, workflow)
+}
+
+func (h *ReconToolsHandler) handleUpdateWorkflow(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的工作流ID")
+		return
+	}
+
+	workflow, err := h.workflowRepo.GetByID(id)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "工作流未找到")
+		return
+	}
+
+	var req struct {
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		Nodes       json.RawMessage `json:"nodes"`
+		Edges       json.RawMessage `json:"edges"`
+		IsTemplate  bool            `json:"is_template"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "无效的请求参数")
+		return
+	}
+
+	if req.Name != "" {
+		workflow.Name = req.Name
+	}
+	if req.Description != "" {
+		workflow.Description = req.Description
+	}
+	if string(req.Nodes) != "" {
+		workflow.Nodes = string(req.Nodes)
+	}
+	if string(req.Edges) != "" {
+		workflow.Edges = string(req.Edges)
+	}
+	workflow.IsTemplate = req.IsTemplate
+
+	if err := h.workflowRepo.Update(workflow); err != nil {
+		respondError(w, http.StatusInternalServerError, "更新工作流失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, workflow)
+}
+
+func (h *ReconToolsHandler) handleDeleteWorkflow(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的工作流ID")
+		return
+	}
+
+	if err := h.workflowRepo.Delete(id); err != nil {
+		respondError(w, http.StatusInternalServerError, "删除工作流失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{
+		"message": "工作流已删除",
+	})
+}
+
+func (h *ReconToolsHandler) handleExecuteWorkflow(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的工作流ID")
+		return
+	}
+
+	var req struct {
+		TargetID     string                 `json:"target_id"`
+		GlobalConfig map[string]interface{} `json:"global_config"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "无效的请求参数")
+		return
+	}
+
+	targetID, err := uuid.Parse(req.TargetID)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的目标ID")
+		return
+	}
+
+	exec, err := h.workflowEngine.ExecuteWorkflow(id, targetID, req.GlobalConfig)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "执行工作流失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusAccepted, exec)
+}
+
+func (h *ReconToolsHandler) handleGetWorkflowExecution(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的执行ID")
+		return
+	}
+
+	exec, err := h.workflowExecRepo.GetByID(id)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "执行记录未找到")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, exec)
+}
+
+func (h *ReconToolsHandler) handleListToolExecutions(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的工作流执行ID")
+		return
+	}
+
+	execs, err := h.toolExecRepo.ListByWorkflowExecution(id)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "获取工具执行记录失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"executions": execs,
+	})
+}
+
+func (h *ReconToolsHandler) handleListDataSources(w http.ResponseWriter, r *http.Request) {
+	enabledOnly := r.URL.Query().Get("enabled") == "true"
+
+	var dsList []*models.DataSource
+	var err error
+
+	if enabledOnly {
+		dsList, err = repository.NewDataSourceRepository(nil).ListEnabled()
+	} else {
+		dsList, err = repository.NewDataSourceRepository(nil).List()
+	}
+
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "获取数据源列表失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"datasources": dsList,
+	})
+}
+
+func (h *ReconToolsHandler) handleCreateDataSource(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name        string                 `json:"name"`
+		Type        string                 `json:"type"`
+		BaseURL     string                 `json:"base_url"`
+		APIKey      string                 `json:"api_key"`
+		Config      map[string]interface{} `json:"config"`
+		Priority    int                    `json:"priority"`
+		RateLimit   int                    `json:"rate_limit"`
+		Enabled     bool                   `json:"enabled"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "无效的请求参数")
+		return
+	}
+
+	ds := &models.DataSource{
+		ID:        uuid.New(),
+		Name:      req.Name,
+		Type:      req.Type,
+		BaseURL:   req.BaseURL,
+		APIKey:    req.APIKey,
+		Config:    toJSON(req.Config),
+		Priority:  req.Priority,
+		RateLimit: req.RateLimit,
+		Enabled:   req.Enabled,
+	}
+
+	if err := repository.NewDataSourceRepository(nil).Create(ds); err != nil {
+		respondError(w, http.StatusInternalServerError, "创建数据源失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusCreated, ds)
+}
+
+func (h *ReconToolsHandler) handleUpdateDataSource(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的数据源ID")
+		return
+	}
+
+	ds, err := repository.NewDataSourceRepository(nil).GetByID(id)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "数据源未找到")
+		return
+	}
+
+	var req struct {
+		Name        string                 `json:"name"`
+		Type        string                 `json:"type"`
+		BaseURL     string                 `json:"base_url"`
+		APIKey      string                 `json:"api_key"`
+		Config      map[string]interface{} `json:"config"`
+		Priority    int                    `json:"priority"`
+		RateLimit   int                    `json:"rate_limit"`
+		Enabled     bool                   `json:"enabled"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "无效的请求参数")
+		return
+	}
+
+	if req.Name != "" {
+		ds.Name = req.Name
+	}
+	if req.Type != "" {
+		ds.Type = req.Type
+	}
+	if req.BaseURL != "" {
+		ds.BaseURL = req.BaseURL
+	}
+	if req.APIKey != "" {
+		ds.APIKey = req.APIKey
+	}
+	if req.Config != nil {
+		ds.Config = toJSON(req.Config)
+	}
+	if req.Priority != 0 {
+		ds.Priority = req.Priority
+	}
+	if req.RateLimit != 0 {
+		ds.RateLimit = req.RateLimit
+	}
+	ds.Enabled = req.Enabled
+
+	if err := repository.NewDataSourceRepository(nil).Update(ds); err != nil {
+		respondError(w, http.StatusInternalServerError, "更新数据源失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, ds)
+}
+
+func (h *ReconToolsHandler) handleDeleteDataSource(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的数据源ID")
+		return
+	}
+
+	if err := repository.NewDataSourceRepository(nil).Delete(id); err != nil {
+		respondError(w, http.StatusInternalServerError, "删除数据源失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{
+		"message": "数据源已删除",
+	})
+}
+
+func toJSON(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		logger.Error("JSON序列化失败: %v", err)
+		return ""
+	}
+	return string(data)
+}

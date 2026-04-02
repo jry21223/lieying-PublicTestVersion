@@ -1,0 +1,607 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"github.com/kunlun-sec/lunying/internal/service"
+)
+
+// EduSRCHandler 教育SRC API处理器
+type EduSRCHandler struct {
+	eduService *service.EduSRCService
+}
+
+func NewEduSRCServiceHandler(eduService *service.EduSRCService) *EduSRCHandler {
+	return &EduSRCHandler{
+		eduService: eduService,
+	}
+}
+
+func (h *EduSRCHandler) RegisterRoutes(mux *http.ServeMux) {
+	// 高校管理
+	mux.HandleFunc("/api/edu/universities", h.handleUniversities)
+	mux.HandleFunc("/api/edu/universities/", h.handleUniversity)
+	mux.HandleFunc("/api/edu/provinces", h.handleProvinces)
+	
+	// 教务系统
+	mux.HandleFunc("/api/edu/systems", h.handleEduSystems)
+	mux.HandleFunc("/api/edu/fingerprints", h.handleFingerprints)
+	mux.HandleFunc("/api/edu/identify", h.handleIdentify)
+	
+	// POC管理
+	mux.HandleFunc("/api/edu/pocs", h.handleEduPOCs)
+	mux.HandleFunc("/api/edu/pocs/", h.handleEduPOC)
+	mux.HandleFunc("/api/edu/pocs/execute", h.handleExecutePOC)
+	
+	// 批量扫描
+	mux.HandleFunc("/api/edu/batch-tasks", h.handleBatchTasks)
+	mux.HandleFunc("/api/edu/batch-tasks/", h.handleBatchTask)
+	mux.HandleFunc("/api/edu/batch-tasks/start", h.handleStartBatchScan)
+	
+	// 扫描结果
+	mux.HandleFunc("/api/edu/scan-results", h.handleScanResults)
+	mux.HandleFunc("/api/edu/scan-results/", h.handleScanResult)
+	
+	// SRC平台
+	mux.HandleFunc("/api/edu/src-platforms", h.handleSRCPlatforms)
+	mux.HandleFunc("/api/edu/src-rules", h.handleSRCRules)
+	mux.HandleFunc("/api/edu/submission-templates", h.handleSubmissionTemplates)
+	mux.HandleFunc("/api/edu/generate-submission", h.handleGenerateSubmission)
+	
+	// 挖洞技巧
+	mux.HandleFunc("/api/edu/tips", h.handleHackingTips)
+	mux.HandleFunc("/api/edu/tips/", h.handleHackingTip)
+	mux.HandleFunc("/api/edu/tips/", h.handleTipLike)
+}
+
+// ==================== 高校管理 ====================
+
+func (h *EduSRCHandler) handleUniversities(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		h.listUniversities(w, r)
+	case http.MethodPost:
+		h.createUniversity(w, r)
+	default:
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *EduSRCHandler) listUniversities(w http.ResponseWriter, r *http.Request) {
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+	province := r.URL.Query().Get("province")
+	hasSRCStr := r.URL.Query().Get("has_src")
+	
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 || pageSize > 100 {
+		pageSize = 20
+	}
+	
+	var hasSRC *bool
+	if hasSRCStr != "" {
+		b, _ := strconv.ParseBool(hasSRCStr)
+		hasSRC = &b
+	}
+	
+	universities, total, err := h.eduService.eduRepo.ListUniversities(page, pageSize, province, hasSRC)
+	if err != nil {
+		http.Error(w, "获取高校列表失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, map[string]interface{}{
+		"data":  universities,
+		"total": total,
+		"page":  page,
+		"page_size": pageSize,
+	})
+}
+
+func (h *EduSRCHandler) createUniversity(w http.ResponseWriter, r *http.Request) {
+	var university models.University
+	if err := json.NewDecoder(r.Body).Decode(&university); err != nil {
+		http.Error(w, "请求参数错误", http.StatusBadRequest)
+		return
+	}
+	
+	if err := h.eduService.eduRepo.CreateUniversity(&university); err != nil {
+		http.Error(w, "创建高校失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, university)
+}
+
+func (h *EduSRCHandler) handleUniversity(w http.ResponseWriter, r *http.Request) {
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/edu/universities/")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		http.Error(w, "无效的ID", http.StatusBadRequest)
+		return
+	}
+	
+	switch r.Method {
+	case http.MethodGet:
+		university, err := h.eduService.eduRepo.GetUniversity(id)
+		if err != nil {
+			http.Error(w, "高校不存在", http.StatusNotFound)
+			return
+		}
+		respondJSON(w, university)
+	case http.MethodPut:
+		var university models.University
+		if err := json.NewDecoder(r.Body).Decode(&university); err != nil {
+			http.Error(w, "请求参数错误", http.StatusBadRequest)
+			return
+		}
+		university.ID = id
+		if err := h.eduService.eduRepo.UpdateUniversity(&university); err != nil {
+			http.Error(w, "更新高校失败", http.StatusInternalServerError)
+			return
+		}
+		respondJSON(w, university)
+	case http.MethodDelete:
+		if err := h.eduService.eduRepo.DeleteUniversity(id); err != nil {
+			http.Error(w, "删除高校失败", http.StatusInternalServerError)
+			return
+		}
+		respondJSON(w, map[string]string{"message": "删除成功"})
+	default:
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *EduSRCHandler) handleProvinces(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	provinces, err := h.eduService.eduRepo.GetProvinces()
+	if err != nil {
+		http.Error(w, "获取省份列表失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, provinces)
+}
+
+// ==================== 教务系统和指纹 ====================
+
+func (h *EduSRCHandler) handleEduSystems(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	universityIDStr := r.URL.Query().Get("university_id")
+	systemType := r.URL.Query().Get("system_type")
+	
+	var universityID uuid.UUID
+	if universityIDStr != "" {
+		universityID, _ = uuid.Parse(universityIDStr)
+	}
+	
+	systems, err := h.eduService.eduRepo.ListEduSystems(universityID, systemType)
+	if err != nil {
+		http.Error(w, "获取教务系统列表失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, systems)
+}
+
+func (h *EduSRCHandler) handleFingerprints(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	systemType := r.URL.Query().Get("system_type")
+	fingerprints, err := h.eduService.eduRepo.ListFingerprints(systemType)
+	if err != nil {
+		http.Error(w, "获取指纹库失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, fingerprints)
+}
+
+func (h *EduSRCHandler) handleIdentify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var req struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "请求参数错误", http.StatusBadRequest)
+		return
+	}
+	
+	result, err := h.eduService.IdentifySystem(req.URL)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, result)
+}
+
+// ==================== POC管理 ====================
+
+func (h *EduSRCHandler) handleEduPOCs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	systemType := r.URL.Query().Get("system_type")
+	severity := r.URL.Query().Get("severity")
+	enabledStr := r.URL.Query().Get("enabled")
+	
+	var enabled *bool
+	if enabledStr != "" {
+		b, _ := strconv.ParseBool(enabledStr)
+		enabled = &b
+	}
+	
+	pocs, err := h.eduService.eduRepo.ListEduPOCs(systemType, severity, enabled)
+	if err != nil {
+		http.Error(w, "获取POC列表失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, pocs)
+}
+
+func (h *EduSRCHandler) handleEduPOC(w http.ResponseWriter, r *http.Request) {
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/edu/pocs/")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		http.Error(w, "无效的ID", http.StatusBadRequest)
+		return
+	}
+	
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	poc, err := h.eduService.eduRepo.GetEduPOC(id)
+	if err != nil {
+		http.Error(w, "POC不存在", http.StatusNotFound)
+		return
+	}
+	
+	respondJSON(w, poc)
+}
+
+func (h *EduSRCHandler) handleExecutePOC(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var req struct {
+		URL   string    `json:"url"`
+		POCID uuid.UUID `json:"poc_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "请求参数错误", http.StatusBadRequest)
+		return
+	}
+	
+	poc, err := h.eduService.eduRepo.GetEduPOC(req.POCID)
+	if err != nil {
+		http.Error(w, "POC不存在", http.StatusNotFound)
+		return
+	}
+	
+	result, err := h.eduService.ExecutePOC(req.URL, poc)
+	if err != nil {
+		http.Error(w, "执行POC失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, result)
+}
+
+// ==================== 批量扫描 ====================
+
+func (h *EduSRCHandler) handleBatchTasks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	status := r.URL.Query().Get("status")
+	tasks, err := h.eduService.eduRepo.ListBatchTasks(status)
+	if err != nil {
+		http.Error(w, "获取批量任务失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, tasks)
+}
+
+func (h *EduSRCHandler) handleBatchTask(w http.ResponseWriter, r *http.Request) {
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/edu/batch-tasks/")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		http.Error(w, "无效的ID", http.StatusBadRequest)
+		return
+	}
+	
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	task, err := h.eduService.eduRepo.GetBatchTask(id)
+	if err != nil {
+		http.Error(w, "任务不存在", http.StatusNotFound)
+		return
+	}
+	
+	respondJSON(w, task)
+}
+
+func (h *EduSRCHandler) handleStartBatchScan(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var config service.BatchScanConfig
+	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
+		http.Error(w, "请求参数错误", http.StatusBadRequest)
+		return
+	}
+	
+	task, err := h.eduService.StartBatchScan(&config)
+	if err != nil {
+		http.Error(w, "启动批量扫描失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, task)
+}
+
+// ==================== 扫描结果 ====================
+
+func (h *EduSRCHandler) handleScanResults(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	taskIDStr := r.URL.Query().Get("task_id")
+	universityIDStr := r.URL.Query().Get("university_id")
+	status := r.URL.Query().Get("status")
+	
+	var taskID, universityID uuid.UUID
+	if taskIDStr != "" {
+		taskID, _ = uuid.Parse(taskIDStr)
+	}
+	if universityIDStr != "" {
+		universityID, _ = uuid.Parse(universityIDStr)
+	}
+	
+	results, err := h.eduService.eduRepo.ListScanResults(taskID, universityID, status)
+	if err != nil {
+		http.Error(w, "获取扫描结果失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, results)
+}
+
+func (h *EduSRCHandler) handleScanResult(w http.ResponseWriter, r *http.Request) {
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/edu/scan-results/")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		http.Error(w, "无效的ID", http.StatusBadRequest)
+		return
+	}
+	
+	switch r.Method {
+	case http.MethodGet:
+		result, err := h.eduService.eduRepo.GetScanResult(id)
+		if err != nil {
+			http.Error(w, "结果不存在", http.StatusNotFound)
+			return
+		}
+		respondJSON(w, result)
+	case http.MethodPut:
+		var result models.EduScanResult
+		if err := json.NewDecoder(r.Body).Decode(&result); err != nil {
+			http.Error(w, "请求参数错误", http.StatusBadRequest)
+			return
+		}
+		result.ID = id
+		if err := h.eduService.eduRepo.UpdateScanResult(&result); err != nil {
+			http.Error(w, "更新失败", http.StatusInternalServerError)
+			return
+		}
+		respondJSON(w, result)
+	case http.MethodDelete:
+		if err := h.eduService.eduRepo.DeleteScanResult(id); err != nil {
+			http.Error(w, "删除失败", http.StatusInternalServerError)
+			return
+		}
+		respondJSON(w, map[string]string{"message": "删除成功"})
+	default:
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+	}
+}
+
+// ==================== SRC平台 ====================
+
+func (h *EduSRCHandler) handleSRCPlatforms(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	platforms, err := h.eduService.eduRepo.ListSRCPlatforms()
+	if err != nil {
+		http.Error(w, "获取SRC平台失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, platforms)
+}
+
+func (h *EduSRCHandler) handleSRCRules(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	platformIDStr := r.URL.Query().Get("platform_id")
+	ruleType := r.URL.Query().Get("type")
+	
+	var platformID uuid.UUID
+	if platformIDStr != "" {
+		platformID, _ = uuid.Parse(platformIDStr)
+	}
+	
+	rules, err := h.eduService.eduRepo.ListSRCRules(platformID, ruleType)
+	if err != nil {
+		http.Error(w, "获取SRC规则失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, rules)
+}
+
+func (h *EduSRCHandler) handleSubmissionTemplates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	platformIDStr := r.URL.Query().Get("platform_id")
+	
+	var platformID uuid.UUID
+	if platformIDStr != "" {
+		platformID, _ = uuid.Parse(platformIDStr)
+	}
+	
+	templates, err := h.eduService.eduRepo.ListSubmissionTemplates(platformID)
+	if err != nil {
+		http.Error(w, "获取提交模板失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, templates)
+}
+
+func (h *EduSRCHandler) handleGenerateSubmission(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var req struct {
+		ScanResultID uuid.UUID `json:"scan_result_id"`
+		TemplateID   uuid.UUID `json:"template_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "请求参数错误", http.StatusBadRequest)
+		return
+	}
+	
+	data, err := h.eduService.GenerateSubmission(req.ScanResultID, req.TemplateID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, data)
+}
+
+// ==================== 挖洞技巧 ====================
+
+func (h *EduSRCHandler) handleHackingTips(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	systemType := r.URL.Query().Get("system_type")
+	vulnType := r.URL.Query().Get("vuln_type")
+	category := r.URL.Query().Get("category")
+	search := r.URL.Query().Get("search")
+	
+	tips, err := h.eduService.eduRepo.ListHackingTips(systemType, vulnType, category, search)
+	if err != nil {
+		http.Error(w, "获取技巧列表失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, tips)
+}
+
+func (h *EduSRCHandler) handleHackingTip(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Path
+	if strings.HasSuffix(path, "/like") {
+		h.handleTipLike(w, r)
+		return
+	}
+	
+	idStr := strings.TrimPrefix(path, "/api/edu/tips/")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		http.Error(w, "无效的ID", http.StatusBadRequest)
+		return
+	}
+	
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	if err := h.eduService.eduRepo.IncrementTipViewCount(id); err != nil {
+	}
+	
+	tip, err := h.eduService.eduRepo.GetHackingTip(id)
+	if err != nil {
+		http.Error(w, "技巧不存在", http.StatusNotFound)
+		return
+	}
+	
+	respondJSON(w, tip)
+}
+
+func (h *EduSRCHandler) handleTipLike(w http.ResponseWriter, r *http.Request) {
+	idStr := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/edu/tips/"), "/like")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		http.Error(w, "无效的ID", http.StatusBadRequest)
+		return
+	}
+	
+	if r.Method != http.MethodPost {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	if err := h.eduService.eduRepo.IncrementTipLikeCount(id); err != nil {
+		http.Error(w, "点赞失败", http.StatusInternalServerError)
+		return
+	}
+	
+	respondJSON(w, map[string]string{"message": "点赞成功"})
+}

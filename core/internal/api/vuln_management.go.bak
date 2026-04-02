@@ -1,0 +1,303 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/kunlun-sec/lunying/internal/models"
+	"github.com/kunlun-sec/lunying/internal/service"
+)
+
+type VulnManagementHandler struct {
+	vulnService *service.VulnerabilityService
+}
+
+func NewVulnManagementHandler(vulnService *service.VulnerabilityService) *VulnManagementHandler {
+	return &VulnManagementHandler{
+		vulnService: vulnService,
+	}
+}
+
+func (h *VulnManagementHandler) respondJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func (h *VulnManagementHandler) respondError(w http.ResponseWriter, status int, message string) {
+	h.respondJSON(w, status, map[string]string{"error": message})
+}
+
+func (h *VulnManagementHandler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/vuln-management/stats", h.GetStats)
+	mux.HandleFunc("/api/vuln-management/vulns", h.GetVulns)
+	mux.HandleFunc("/api/vuln-management/vulns/", h.HandleVuln)
+	mux.HandleFunc("/api/vuln-management/batch", h.BatchOperation)
+	mux.HandleFunc("/api/vuln-management/aggregated", h.GetAggregatedVulns)
+	mux.HandleFunc("/api/vuln-management/report-drafts", h.HandleReportDrafts)
+}
+
+func (h *VulnManagementHandler) GetStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := h.vulnService.GetStats()
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, stats)
+}
+
+func (h *VulnManagementHandler) GetVulns(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+
+	filter := make(map[string]string)
+	for k, v := range query {
+		if len(v) > 0 && k != "page" && k != "page_size" && k != "sort" {
+			filter[k] = v[0]
+		}
+	}
+
+	page, _ := strconv.Atoi(query.Get("page"))
+	if page <= 0 {
+		page = 1
+	}
+
+	pageSize, _ := strconv.Atoi(query.Get("page_size"))
+	if pageSize <= 0 || pageSize > 100 {
+		pageSize = 20
+	}
+
+	sort := query.Get("sort")
+	if sort == "" {
+		sort = "-created_at"
+	}
+
+	vulns, total, err := h.vulnService.FilterVulns(filter, page, pageSize, sort)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	result := map[string]interface{}{
+		"items": vulns,
+		"total": total,
+		"page":  page,
+		"size":  pageSize,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(vulns)
+}
+
+func (h *VulnManagementHandler) HandleVuln(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/vuln-management/vulns/")
+	parts := strings.Split(path, "/")
+	
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	id := parts[0]
+	
+	if len(parts) == 1 {
+		h.GetVuln(w, r, id)
+		return
+	}
+
+	subPath := parts[1]
+	switch subPath {
+	case "comments":
+		if r.Method == "POST" {
+			h.AddComment(w, r, id)
+		}
+	case "status-history":
+		if r.Method == "GET" {
+			h.GetStatusHistory(w, r, id)
+		}
+	case "knowledge":
+		if r.Method == "GET" {
+			h.GetKnowledge(w, r, id)
+		}
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (h *VulnManagementHandler) GetVuln(w http.ResponseWriter, r *http.Request, id string) {
+	vuln, err := h.vulnService.GetVulnByID(id)
+	if err != nil {
+		h.respondError(w, http.StatusNotFound, "Vulnerability not found")
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, vuln)
+}
+
+type BatchRequest struct {
+	IDs     []string `json:"ids"`
+	Action  string   `json:"action"`
+	Params  map[string]interface{} `json:"params,omitempty"`
+}
+
+func (h *VulnManagementHandler) BatchOperation(w http.ResponseWriter, r *http.Request) {
+	var req BatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondError(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	var err error
+	switch req.Action {
+	case "confirm":
+		err = h.vulnService.BatchUpdateStatus(req.IDs, "confirmed", "system")
+	case "ignore":
+		err = h.vulnService.BatchUpdateStatus(req.IDs, "ignored", "system")
+	case "fix":
+		err = h.vulnService.BatchUpdateFixStatus(req.IDs, "fixed", "system")
+	case "verify":
+		err = h.vulnService.BatchUpdateFixStatus(req.IDs, "verified", "system")
+	default:
+		h.respondError(w, http.StatusBadRequest, "Invalid action")
+		return
+	}
+
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, map[string]string{"status": "success"})
+}
+
+type AddCommentRequest struct {
+	Content string `json:"content"`
+	Author  string `json:"author"`
+}
+
+func (h *VulnManagementHandler) AddComment(w http.ResponseWriter, r *http.Request, id string) {
+	var req AddCommentRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondError(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	if req.Author == "" {
+		req.Author = "system"
+	}
+
+	err := h.vulnService.AddComment(id, req.Content, req.Author)
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, map[string]string{"status": "success"})
+}
+
+func (h *VulnManagementHandler) GetStatusHistory(w http.ResponseWriter, r *http.Request, id string) {
+	history, err := h.vulnService.GetStatusHistory(id)
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, history)
+}
+
+func (h *VulnManagementHandler) GetKnowledge(w http.ResponseWriter, r *http.Request, id string) {
+	knowledge, err := h.vulnService.GetRelevantKnowledge(id)
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, knowledge)
+}
+
+func (h *VulnManagementHandler) HandleReportDrafts(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/vuln-management/report-drafts/")
+	
+	if path == "" || path == "/" {
+		if r.Method == "GET" {
+			h.GetReportDrafts(w, r)
+		} else if r.Method == "POST" {
+			h.CreateReportDraft(w, r)
+		}
+		return
+	}
+
+	parts := strings.Split(path, "/")
+	if len(parts) >= 2 && parts[1] == "add-vulns" {
+		if r.Method == "POST" {
+			h.AddToReport(w, r, parts[0])
+		}
+		return
+	}
+
+	http.NotFound(w, r)
+}
+
+func (h *VulnManagementHandler) GetAggregatedVulns(w http.ResponseWriter, r *http.Request) {
+	aggregated, err := h.vulnService.GetAggregatedVulns()
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, aggregated)
+}
+
+func (h *VulnManagementHandler) GetReportDrafts(w http.ResponseWriter, r *http.Request) {
+	drafts, err := h.vulnService.GetReportDrafts()
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, drafts)
+}
+
+type CreateReportDraftRequest struct {
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	VulnIDs     []string `json:"vuln_ids,omitempty"`
+}
+
+func (h *VulnManagementHandler) CreateReportDraft(w http.ResponseWriter, r *http.Request) {
+	var req CreateReportDraftRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondError(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	draft, err := h.vulnService.CreateReportDraft(req.Title, req.Description, req.VulnIDs)
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, draft)
+}
+
+type AddToReportRequest struct {
+	VulnIDs []string `json:"vuln_ids"`
+}
+
+func (h *VulnManagementHandler) AddToReport(w http.ResponseWriter, r *http.Request, id string) {
+	var req AddToReportRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondError(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	err := h.vulnService.AddVulnsToReport(id, req.VulnIDs)
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, map[string]string{"status": "success"})
+}

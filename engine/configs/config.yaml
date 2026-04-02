@@ -1,0 +1,51 @@
+server:
+  port: 8080
+  mode: debug
+
+database:
+  host: localhost
+  port: 5432
+  user: lieying
+  password: lieying123
+  dbname: lieying_db
+
+redis:
+  host: localhost
+  port: 6379
+  password: ""
+  db: 0
+
+rabbitmq:
+  host: localhost
+  port: 5672
+  user: guest
+  password: guest
+  vhost: /
+
+engine:
+  workers: 10
+  task_queue_size: 1000
+
+network:
+  mode: offline
+  proxy:
+    enabled: false
+    type: socks5
+    host: 127.0.0.1
+    port: 1080
+    username: ""
+    password: ""
+  allowed_hosts: []
+  blocked_hosts: []
+
+ai:
+  mode: local
+  local:
+    provider: ollama
+    endpoint: http://localhost:11434
+    model: qwen2.5:7b
+  remote:
+    provider: openai
+    api_key: ""
+    base_url: https://api.deepseek.com
+    model: deepseek-chat

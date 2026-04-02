@@ -1,0 +1,545 @@
+package service
+
+import (
+	"encoding/json"
+	"fmt"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/logger"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"github.com/kunlun-sec/lunying/internal/repository"
+	"gorm.io/gorm"
+)
+
+type ToolService struct {
+	toolRepo *repository.ToolRepository
+}
+
+func NewToolService(toolRepo *repository.ToolRepository) *ToolService {
+	return &ToolService{toolRepo: toolRepo}
+}
+
+func (s *ToolService) Initialize() error {
+	return s.toolRepo.InitializeDefaultTools()
+}
+
+func (s *ToolService) GetTool(id uuid.UUID) (*models.Tool, error) {
+	return s.toolRepo.GetByID(id)
+}
+
+func (s *ToolService) GetToolByName(name string) (*models.Tool, error) {
+	return s.toolRepo.GetByName(name)
+}
+
+func (s *ToolService) ListTools() ([]*models.Tool, error) {
+	return s.toolRepo.List()
+}
+
+func (s *ToolService) ListToolsByCategory(category string) ([]*models.Tool, error) {
+	return s.toolRepo.ListByCategory(category)
+}
+
+func (s *ToolService) UpdateTool(tool *models.Tool) error {
+	return s.toolRepo.Update(tool)
+}
+
+func (s *ToolService) CheckInstallation(tool *models.Tool) (bool, string, error) {
+	cmd := exec.Command("which", tool.Command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return false, "", nil
+	}
+
+	path := strings.TrimSpace(string(output))
+	cmd = exec.Command(tool.Command, "--version")
+	versionOutput, _ := cmd.CombinedOutput()
+	version := strings.TrimSpace(string(versionOutput))
+
+	return true, path + " " + version, nil
+}
+
+func (s *ToolService) UpdateInstallationStatus(id uuid.UUID) error {
+	tool, err := s.toolRepo.GetByID(id)
+	if err != nil {
+		return err
+	}
+
+	installed, version, err := s.CheckInstallation(tool)
+	if err != nil {
+		return err
+	}
+
+	if installed {
+		return s.toolRepo.MarkInstalled(id, version, "")
+	} else {
+		return s.toolRepo.MarkNotInstalled(id)
+	}
+}
+
+type ToolExecutor struct {
+	toolRepo       *repository.ToolRepository
+	assetService   *AssetService
+	execLogRepo    *repository.ToolExecutionRepository
+	workflowLogRepo *repository.WorkflowExecutionRepository
+}
+
+func NewToolExecutor(
+	toolRepo *repository.ToolRepository,
+	assetService *AssetService,
+	execLogRepo *repository.ToolExecutionRepository,
+	workflowLogRepo *repository.WorkflowExecutionRepository,
+) *ToolExecutor {
+	return &ToolExecutor{
+		toolRepo:       toolRepo,
+		assetService:   assetService,
+		execLogRepo:    execLogRepo,
+		workflowLogRepo: workflowLogRepo,
+	}
+}
+
+func (e *ToolExecutor) ExecuteTool(
+	tool *models.Tool,
+	input map[string]interface{},
+	targetID uuid.UUID,
+	workflowExecID *uuid.UUID,
+) (*models.ToolExecution, error) {
+	execID := uuid.New()
+	startTime := time.Now()
+
+	toolExec := &models.ToolExecution{
+		ID:              execID,
+		ToolID:          tool.ID,
+		ToolName:        tool.Name,
+		TargetID:        targetID,
+		WorkflowExecID:  workflowExecID,
+		Status:          "running",
+		Input:           toJSON(input),
+	}
+
+	if err := e.execLogRepo.Create(toolExec); err != nil {
+		return nil, err
+	}
+
+	output, parsedOutput, errMsg, exitCode := e.runTool(tool, input)
+	duration := time.Since(startTime).Milliseconds()
+
+	toolExec.Status = "completed"
+	if exitCode != 0 || errMsg != "" {
+		toolExec.Status = "failed"
+	}
+
+	toolExec.Output = output
+	toolExec.ParsedOutput = parsedOutput
+	toolExec.Error = errMsg
+	toolExec.ExitCode = exitCode
+	toolExec.Duration = duration
+	toolExec.CompletedAt = &startTime
+
+	if err := e.execLogRepo.Update(toolExec); err != nil {
+		return nil, err
+	}
+
+	if toolExec.Status == "completed" {
+		e.processToolOutput(tool, parsedOutput, targetID)
+	}
+
+	return toolExec, nil
+}
+
+func (e *ToolExecutor) runTool(tool *models.Tool, input map[string]interface{}) (string, string, string, int) {
+	switch tool.Name {
+	case "subfinder":
+		return e.runSubfinder(tool, input)
+	case "nmap":
+		return e.runNmap(tool, input)
+	default:
+		return "", "", fmt.Sprintf("工具 %s 暂不支持执行", tool.Name), 1
+	}
+}
+
+func (e *ToolExecutor) runSubfinder(tool *models.Tool, input map[string]interface{}) (string, string, string, int) {
+	domain, ok := input["domain"].(string)
+	if !ok {
+		return "", "", "domain参数无效", 1
+	}
+
+	cmd := exec.Command("subfinder", "-d", domain, "-silent")
+	output, err := cmd.CombinedOutput()
+	
+	if err != nil {
+		return string(output), "", err.Error(), 1
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	subdomains := []string{}
+	for _, line := range lines {
+		if line != "" {
+			subdomains = append(subdomains, line)
+		}
+	}
+
+	parsed := map[string]interface{}{
+		"subdomains": subdomains,
+		"count":      len(subdomains),
+	}
+	parsedJSON, _ := json.Marshal(parsed)
+
+	return string(output), string(parsedJSON), "", 0
+}
+
+func (e *ToolExecutor) runNmap(tool *models.Tool, input map[string]interface{}) (string, string, string, int) {
+	ip, ok := input["ip"].(string)
+	if !ok {
+		return "", "", "ip参数无效", 1
+	}
+
+	ports := "1-65535"
+	if p, ok := input["ports"].(string); ok {
+		ports = p
+	}
+
+	cmd := exec.Command("nmap", "-p", ports, "-sV", "-T4", ip)
+	output, err := cmd.CombinedOutput()
+	
+	if err != nil {
+		return string(output), "", err.Error(), 1
+	}
+
+	parsed := map[string]interface{}{
+		"raw_output": string(output),
+		"ip":         ip,
+	}
+	parsedJSON, _ := json.Marshal(parsed)
+
+	return string(output), string(parsedJSON), "", 0
+}
+
+func (e *ToolExecutor) processToolOutput(tool *models.Tool, parsedOutput string, targetID uuid.UUID) {
+	if parsedOutput == "" {
+		return
+	}
+
+	var output map[string]interface{}
+	if err := json.Unmarshal([]byte(parsedOutput), &output); err != nil {
+		return
+	}
+
+	switch tool.OutputType {
+	case "domains":
+		if subdomains, ok := output["subdomains"].([]interface{}); ok {
+			for _, s := range subdomains {
+				if subdomain, ok := s.(string); ok {
+					logger.Info("发现子域名: %s", subdomain)
+					parentDomain := strings.Join(strings.Split(subdomain, ".")[1:], ".")
+					e.assetService.CreateSubdomainAsset(targetID, parentDomain, subdomain)
+				}
+			}
+		}
+	case "ports":
+	case "services":
+	case "fingerprints":
+	case "paths":
+	case "secrets":
+	}
+}
+
+type WorkflowEngine struct {
+	db                *gorm.DB
+	workflowRepo      *repository.WorkflowRepository
+	workflowExecRepo  *repository.WorkflowExecutionRepository
+	toolExecutor      *ToolExecutor
+	assetService      *AssetService
+	activeExecutions  map[uuid.UUID]bool
+	execMutex         sync.RWMutex
+}
+
+func NewWorkflowEngine(
+	db *gorm.DB,
+	workflowRepo *repository.WorkflowRepository,
+	workflowExecRepo *repository.WorkflowExecutionRepository,
+	toolExecutor *ToolExecutor,
+	assetService *AssetService,
+) *WorkflowEngine {
+	return &WorkflowEngine{
+		db:               db,
+		workflowRepo:     workflowRepo,
+		workflowExecRepo: workflowExecRepo,
+		toolExecutor:     toolExecutor,
+		assetService:     assetService,
+		activeExecutions: make(map[uuid.UUID]bool),
+	}
+}
+
+func (we *WorkflowEngine) ExecuteWorkflow(
+	workflowID uuid.UUID,
+	targetID uuid.UUID,
+	globalConfig map[string]interface{},
+) (*models.WorkflowExecution, error) {
+	workflow, err := we.workflowRepo.GetByID(workflowID)
+	if err != nil {
+		return nil, fmt.Errorf("工作流不存在: %w", err)
+	}
+
+	execID := uuid.New()
+	exec := &models.WorkflowExecution{
+		ID:           execID,
+		WorkflowID:   workflowID,
+		TargetID:     targetID,
+		Status:       "pending",
+		Progress:     0,
+		Logs:         "",
+		GlobalConfig: toJSON(globalConfig),
+	}
+
+	if err := we.workflowExecRepo.Create(exec); err != nil {
+		return nil, err
+	}
+
+	go we.runExecution(exec, workflow)
+
+	return exec, nil
+}
+
+func (we *WorkflowEngine) runExecution(
+	exec *models.WorkflowExecution,
+	workflow *models.Workflow,
+) {
+	we.execMutex.Lock()
+	we.activeExecutions[exec.ID] = true
+	we.execMutex.Unlock()
+
+	defer func() {
+		we.execMutex.Lock()
+		delete(we.activeExecutions, exec.ID)
+		we.execMutex.Unlock()
+	}()
+
+	we.workflowExecRepo.UpdateStatus(exec.ID, "running", 0, "开始执行工作流")
+
+	var nodes []map[string]interface{}
+	if workflow.Nodes != "" {
+		json.Unmarshal([]byte(workflow.Nodes), &nodes)
+	}
+
+	if len(nodes) == 0 {
+		we.workflowExecRepo.UpdateStatus(exec.ID, "failed", 0, "工作流没有节点")
+		return
+	}
+
+	for i, node := range nodes {
+		toolName, _ := node["tool"].(string)
+		tool, err := we.toolExecutor.toolRepo.GetByName(toolName)
+		if err != nil {
+			we.workflowExecRepo.AppendLogs(exec.ID, fmt.Sprintf("[错误] 工具 %s 未找到\n", toolName))
+			continue
+		}
+
+		we.workflowExecRepo.AppendLogs(exec.ID, fmt.Sprintf("[信息] 开始执行工具: %s\n", tool.DisplayName))
+
+		nodeConfig, _ := node["config"].(map[string]interface{})
+		input := make(map[string]interface{})
+		for k, v := range nodeConfig {
+			input[k] = v
+		}
+
+		we.toolExecutor.ExecuteTool(tool, input, exec.TargetID, &exec.ID)
+
+		progress := ((i + 1) * 100) / len(nodes)
+		we.workflowExecRepo.UpdateStatus(exec.ID, "running", progress, fmt.Sprintf("完成 %d/%d", i+1, len(nodes)))
+	}
+
+	we.workflowExecRepo.UpdateStatus(exec.ID, "completed", 100, "工作流执行完成")
+}
+
+func (we *WorkflowEngine) CreateDefaultWorkflow(name string, description string) (*models.Workflow, error) {
+	workflow := &models.Workflow{
+		ID:          uuid.New(),
+		Name:        name,
+		Description: description,
+		IsTemplate:  true,
+	}
+
+	nodes := []map[string]interface{}{
+		{
+			"id":   "subfinder",
+			"type": "tool",
+			"tool": "subfinder",
+			"label": "子域名枚举",
+		},
+		{
+			"id":   "nmap",
+			"type": "tool",
+			"tool": "nmap",
+			"label": "端口扫描",
+		},
+		{
+			"id":   "wappalyzer",
+			"type": "tool",
+			"tool": "wappalyzer",
+			"label": "指纹识别",
+		},
+	}
+
+	edges := []map[string]interface{}{
+		{"source": "subfinder", "target": "nmap"},
+		{"source": "nmap", "target": "wappalyzer"},
+	}
+
+	nodesJSON, _ := json.Marshal(nodes)
+	edgesJSON, _ := json.Marshal(edges)
+	workflow.Nodes = string(nodesJSON)
+	workflow.Edges = string(edgesJSON)
+
+	if err := we.workflowRepo.Create(workflow); err != nil {
+		return nil, err
+	}
+
+	return workflow, nil
+}
+
+type AssetDeduplicator struct {
+	assetRepo *repository.AssetRepository
+}
+
+func NewAssetDeduplicator(assetRepo *repository.AssetRepository) *AssetDeduplicator {
+	return &AssetDeduplicator{assetRepo: assetRepo}
+}
+
+func (ad *AssetDeduplicator) FindDuplicate(asset *models.Asset) (*models.Asset, error) {
+	existing, err := ad.assetRepo.GetByTypeAndValue(asset.Type, asset.Value, asset.TargetID)
+	if err == nil && existing != nil {
+		return existing, nil
+	}
+
+	if asset.Type == "port" {
+		ip, _ := asset.ExtraData["ip"].(string)
+		portNum, _ := asset.ExtraData["port"].(float64)
+		protocol, _ := asset.ExtraData["protocol"].(string)
+		
+		existing, err := ad.assetRepo.FindPortAsset(asset.TargetID, ip, int(portNum), protocol)
+		if err == nil && existing != nil {
+			return existing, nil
+		}
+	}
+
+	if asset.Type == "service" {
+		ip, _ := asset.ExtraData["ip"].(string)
+		portNum, _ := asset.ExtraData["port"].(float64)
+		protocol, _ := asset.ExtraData["protocol"].(string)
+		
+		existing, err := ad.assetRepo.FindServiceAsset(asset.TargetID, ip, int(portNum), protocol)
+		if err == nil && existing != nil {
+			return existing, nil
+		}
+	}
+
+	return nil, nil
+}
+
+func (ad *AssetDeduplicator) MergeAssets(existing, new *models.Asset) (*models.Asset, error) {
+	now := time.Now()
+	existing.LastSeen = &now
+
+	if new.Description != "" {
+		existing.Description = new.Description
+	}
+
+	if new.Status != "" {
+		existing.Status = new.Status
+	}
+
+	if new.Importance > existing.Importance {
+		existing.Importance = new.Importance
+	}
+
+	existing.Extra = ad.mergeExtra(existing.Extra, new.Extra)
+
+	existing.Tags = ad.mergeTags(existing.Tags, new.Tags)
+
+	if err := ad.assetRepo.Update(existing); err != nil {
+		return nil, err
+	}
+
+	return existing, nil
+}
+
+func (ad *AssetDeduplicator) mergeExtra(existingJSON, newJSON string) string {
+	var existing, newData map[string]interface{}
+	
+	if existingJSON != "" {
+		json.Unmarshal([]byte(existingJSON), &existing)
+	}
+	if existing == nil {
+		existing = make(map[string]interface{})
+	}
+	
+	if newJSON != "" {
+		json.Unmarshal([]byte(newJSON), &newData)
+	}
+	
+	for k, v := range newData {
+		existing[k] = v
+	}
+	
+	result, _ := json.Marshal(existing)
+	return string(result)
+}
+
+func (ad *AssetDeduplicator) mergeTags(existing, new string) string {
+	tagSet := make(map[string]bool)
+	
+	if existing != "" {
+		for _, t := range strings.Split(existing, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				tagSet[t] = true
+			}
+		}
+	}
+	
+	if new != "" {
+		for _, t := range strings.Split(new, ",") {
+			if t = strings.TrimSpace(t); t != "" {
+				tagSet[t] = true
+			}
+		}
+	}
+	
+	tags := make([]string, 0, len(tagSet))
+	for t := range tagSet {
+		tags = append(tags, t)
+	}
+	
+	return strings.Join(tags, ",")
+}
+
+func (ad *AssetDeduplicator) CreateOrMerge(asset *models.Asset) (*models.Asset, error) {
+	existing, err := ad.FindDuplicate(asset)
+	if err != nil {
+		return nil, err
+	}
+
+	if existing != nil {
+		return ad.MergeAssets(existing, asset)
+	}
+
+	if err := ad.assetRepo.Create(asset); err != nil {
+		return nil, err
+	}
+
+	return asset, nil
+}
+
+func toJSON(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}

@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+
+# Environment
+.env
+.env.local
+
+# Executables
+*.exe
+*.dll
+*.so
+*.db
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# System
+.DS_Store
+Thumbs.db
+*.log
+
+# Go runtime (large, not needed)
+runtime/
+
+# Build artifacts
+core/src/lieying_server.exe
+frontend/node_modules/

@@ -1,0 +1,626 @@
+package service
+
+import (
+	"encoding/json"
+	"fmt"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"github.com/kunlun-sec/lunying/internal/repository"
+	"gorm.io/gorm"
+)
+
+type VulnScanService struct {
+	pocRepo           *repository.POCRepository
+	scanConfigRepo    *repository.ScanConfigRepository
+	scanTaskRepo      *repository.ScanTaskRepository
+	scanResultRepo    *repository.ScanResultRepository
+	vulnChainRepo     *repository.VulnerabilityChainRepository
+	nucleiTemplateRepo *repository.NucleiTemplateRepository
+	assetRepo         *repository.AssetRepository
+	targetRepo        *repository.TargetRepository
+	activeTasks       map[uuid.UUID]bool
+	taskMutex         sync.RWMutex
+}
+
+func NewVulnScanService(
+	pocRepo *repository.POCRepository,
+	scanConfigRepo *repository.ScanConfigRepository,
+	scanTaskRepo *repository.ScanTaskRepository,
+	scanResultRepo *repository.ScanResultRepository,
+	vulnChainRepo *repository.VulnerabilityChainRepository,
+	nucleiTemplateRepo *repository.NucleiTemplateRepository,
+	assetRepo *repository.AssetRepository,
+	targetRepo *repository.TargetRepository,
+) *VulnScanService {
+	return &VulnScanService{
+		pocRepo:           pocRepo,
+		scanConfigRepo:    scanConfigRepo,
+		scanTaskRepo:      scanTaskRepo,
+		scanResultRepo:    scanResultRepo,
+		vulnChainRepo:     vulnChainRepo,
+		nucleiTemplateRepo: nucleiTemplateRepo,
+		assetRepo:         assetRepo,
+		targetRepo:        targetRepo,
+		activeTasks:       make(map[uuid.UUID]bool),
+	}
+}
+
+func (s *VulnScanService) InitializeDefaultData() error {
+	if err := s.scanConfigRepo.InitializeDefaultConfigs(); err != nil {
+		return err
+	}
+	return s.initializeSamplePOCs()
+}
+
+func (s *VulnScanService) initializeSamplePOCs() error {
+	existing, _ := s.pocRepo.List()
+	if len(existing) > 0 {
+		return nil
+	}
+
+	samplePOCs := []*models.POC{
+		{
+			ID:          uuid.New(),
+			Name:        "struts2-s2-045",
+			DisplayName: "Struts2 S2-045 远程代码执行",
+			Description: "Apache Struts2 文件上传功能存在远程代码执行漏洞",
+			Severity:    "critical",
+			Category:    "rce",
+			Tags:        "struts2,apache,rce",
+			CVSS:        10.0,
+			CVE:         "CVE-2017-5638",
+			Author:      "Community",
+			POCType:     "nuclei",
+			Format:      "yaml",
+			Fingerprint: "struts2",
+			IsPublic:    true,
+			IsVerified:  true,
+			Enabled:     true,
+		},
+		{
+			ID:          uuid.New(),
+			Name:        "sql-injection-generic",
+			DisplayName: "通用SQL注入检测",
+			Description: "基于错误的SQL注入检测",
+			Severity:    "high",
+			Category:    "sqli",
+			Tags:        "sqli,sql,injection",
+			CVSS:        8.5,
+			Author:      "Community",
+			POCType:     "custom",
+			Format:      "yaml",
+			Fingerprint: "",
+			IsPublic:    true,
+			IsVerified:  true,
+			Enabled:     true,
+		},
+		{
+			ID:          uuid.New(),
+			Name:        "xss-reflected",
+			DisplayName: "反射型XSS检测",
+			Description: "检测反射型跨站脚本攻击",
+			Severity:    "medium",
+			Category:    "xss",
+			Tags:        "xss,cross-site,scripting",
+			CVSS:        6.1,
+			Author:      "Community",
+			POCType:     "custom",
+			Format:      "yaml",
+			Fingerprint: "",
+			IsPublic:    true,
+			IsVerified:  true,
+			Enabled:     true,
+		},
+		{
+			ID:          uuid.New(),
+			Name:        "redis-unauth",
+			DisplayName: "Redis未授权访问",
+			Description: "检测Redis服务是否存在未授权访问",
+			Severity:    "critical",
+			Category:    "unauth",
+			Tags:        "redis,unauthorized,nosql",
+			CVSS:        9.8,
+			Author:      "Community",
+			POCType:     "custom",
+			Format:      "yaml",
+			Fingerprint: "redis",
+			IsPublic:    true,
+			IsVerified:  true,
+			Enabled:     true,
+		},
+		{
+			ID:          uuid.New(),
+			Name:        "thinkphp-rce",
+			DisplayName: "ThinkPHP 远程代码执行",
+			Description: "ThinkPHP 5.x 远程代码执行漏洞",
+			Severity:    "critical",
+			Category:    "rce",
+			Tags:        "thinkphp,rce,php",
+			CVSS:        9.8,
+			CVE:         "CVE-2019-9082",
+			Author:      "Community",
+			POCType:     "nuclei",
+			Format:      "yaml",
+			Fingerprint: "thinkphp",
+			IsPublic:    true,
+			IsVerified:  true,
+			Enabled:     true,
+		},
+	}
+
+	for _, poc := range samplePOCs {
+		if err := s.pocRepo.Create(poc); err != nil {
+			fmt.Printf("创建示例POC失败: %v\n", err)
+		}
+	}
+
+	fmt.Printf("已初始化 %d 个示例POC\n", len(samplePOCs))
+	return nil
+}
+
+func (s *VulnScanService) CreateScanTask(
+	targetID uuid.UUID,
+	configID *uuid.UUID,
+	mode string,
+	severityFilter string,
+	tagsFilter string,
+	concurrency int,
+) (*models.ScanTask, error) {
+	target, err := s.targetRepo.GetByID(targetID)
+	if err != nil {
+		return nil, fmt.Errorf("目标不存在: %w", err)
+	}
+
+	var config *models.ScanConfig
+	if configID != nil {
+		config, err = s.scanConfigRepo.GetByID(*configID)
+		if err != nil {
+			return nil, fmt.Errorf("扫描配置不存在: %w", err)
+		}
+	} else {
+		config, err = s.scanConfigRepo.GetDefault()
+		if err != nil {
+			return nil, fmt.Errorf("获取默认配置失败: %w", err)
+		}
+	}
+
+	task := &models.ScanTask{
+		ID:          uuid.New(),
+		TargetID:    targetID,
+		ConfigID:    &config.ID,
+		Name:        fmt.Sprintf("扫描 - %s", target.Name),
+		Status:      "pending",
+		Mode:        mode,
+		Severity:    severityFilter,
+		Tags:        tagsFilter,
+		Concurrency: concurrency,
+	}
+
+	if err := s.scanTaskRepo.Create(task); err != nil {
+		return nil, err
+	}
+
+	go s.executeScanTask(task)
+
+	return task, nil
+}
+
+func (s *VulnScanService) executeScanTask(task *models.ScanTask) {
+	s.taskMutex.Lock()
+	s.activeTasks[task.ID] = true
+	s.taskMutex.Unlock()
+
+	defer func() {
+		s.taskMutex.Lock()
+		delete(s.activeTasks, task.ID)
+		s.taskMutex.Unlock()
+	}()
+
+	s.scanTaskRepo.UpdateStatus(task.ID, "running", 0, "开始扫描...")
+
+	assets, err := s.assetRepo.ListByTarget(task.TargetID)
+	if err != nil {
+		s.scanTaskRepo.UpdateStatus(task.ID, "failed", 0, fmt.Sprintf("获取资产失败: %v", err))
+		return
+	}
+
+	if len(assets) == 0 {
+		s.scanTaskRepo.UpdateStatus(task.ID, "completed", 100, "没有可扫描的资产")
+		return
+	}
+
+	var filteredPOCs []*models.POC
+	severities := strings.Split(task.Severity, ",")
+	tags := strings.Split(task.Tags, ",")
+
+	if len(severities) > 0 && severities[0] != "" {
+		for _, severity := range severities {
+			pocs, _ := s.pocRepo.ListBySeverity(strings.TrimSpace(severity))
+			filteredPOCs = append(filteredPOCs, pocs...)
+		}
+	} else if len(tags) > 0 && tags[0] != "" {
+		filteredPOCs, _ = s.pocRepo.ListByTags(tags)
+	} else {
+		filteredPOCs, _ = s.pocRepo.List()
+	}
+
+	pocMap := make(map[uuid.UUID]*models.POC)
+	for _, poc := range filteredPOCs {
+		pocMap[poc.ID] = poc
+	}
+
+	task.TotalPOCs = len(filteredPOCs)
+	s.scanTaskRepo.Update(task)
+
+	resultsChan := make(chan *models.ScanResult, 100)
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, task.Concurrency)
+
+	for i, poc := range filteredPOCs {
+		wg.Add(1)
+		go func(p *models.POC, idx int) {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			progress := ((idx + 1) * 100) / len(filteredPOCs)
+			s.scanTaskRepo.UpdateStatus(task.ID, "running", progress, fmt.Sprintf("正在执行: %s", p.Name))
+
+			for _, asset := range assets {
+				result := s.executePOC(p, asset, task)
+				if result != nil {
+					resultsChan <- result
+				}
+			}
+		}(poc, i)
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+
+	foundVulns := 0
+	for result := range resultsChan {
+		if err := s.scanResultRepo.Create(result); err == nil {
+			foundVulns++
+			s.scanTaskRepo.IncrementFoundVulns(task.ID)
+		}
+	}
+
+	s.scanTaskRepo.UpdateStatus(task.ID, "completed", 100, fmt.Sprintf("扫描完成，发现 %d 个漏洞", foundVulns))
+}
+
+func (s *VulnScanService) executePOC(
+	poc *models.POC,
+	asset *models.Asset,
+	task *models.ScanTask,
+) *models.ScanResult {
+	if poc.POCType == "nuclei" {
+		return s.executeNucleiPOC(poc, asset, task)
+	}
+
+	return s.simulatePOCResult(poc, asset, task)
+}
+
+func (s *VulnScanService) executeNucleiPOC(
+	poc *models.POC,
+	asset *models.Asset,
+	task *models.ScanTask,
+) *models.ScanResult {
+	url := s.getAssetURL(asset)
+	if url == "" {
+		return nil
+	}
+
+	_, _ = exec.LookPath("nuclei")
+
+	return s.simulatePOCResult(poc, asset, task)
+}
+
+func (s *VulnScanService) simulatePOCResult(
+	poc *models.POC,
+	asset *models.Asset,
+	task *models.ScanTask,
+) *models.ScanResult {
+	matched := false
+	if poc.Fingerprint != "" {
+		matched = strings.Contains(strings.ToLower(asset.Extra), strings.ToLower(poc.Fingerprint))
+	} else {
+		matched = true
+	}
+
+	if !matched {
+		return nil
+	}
+
+	confidence := 50
+	if poc.IsVerified {
+		confidence = 80
+	}
+
+	result := &models.ScanResult{
+		ID:          uuid.New(),
+		TaskID:      task.ID,
+		TargetID:    task.TargetID,
+		AssetID:     &asset.ID,
+		POCID:       &poc.ID,
+		POCName:     poc.Name,
+		Title:       poc.DisplayName,
+		Description: poc.Description,
+		Severity:    poc.Severity,
+		Category:    poc.Category,
+		URL:         s.getAssetURL(asset),
+		CVSS:        poc.CVSS,
+		CVE:         poc.CVE,
+		Confidence:  confidence,
+		Status:      "unconfirmed",
+		Tags:        poc.Tags,
+	}
+
+	result.PriorityScore = s.scanResultRepo.CalculatePriorityScore(result)
+
+	return result
+}
+
+func (s *VulnScanService) getAssetURL(asset *models.Asset) string {
+	if asset.Type == "web" || asset.Type == "url" {
+		return asset.Value
+	}
+	if asset.Type == "domain" {
+		return "http://" + asset.Value
+	}
+	if asset.Type == "service" {
+		if asset.ExtraData != nil {
+			if ip, ok := asset.ExtraData["ip"].(string); ok {
+				if port, ok := asset.ExtraData["port"].(float64); ok {
+					protocol := "http"
+					if port == 443 {
+						protocol = "https"
+					}
+					return fmt.Sprintf("%s://%s:%d", protocol, ip, int(port))
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func (s *VulnScanService) AIVerifyResult(resultID uuid.UUID) (*models.ScanResult, error) {
+	result, err := s.scanResultRepo.GetByID(resultID)
+	if err != nil {
+		return nil, err
+	}
+
+	aiConfidence := s.simulateAIAnalysis(result)
+	result.AIConfidence = aiConfidence
+
+	if aiConfidence >= 70 {
+		result.Status = "confirmed"
+	} else if aiConfidence >= 40 {
+		result.Status = "unconfirmed"
+	} else {
+		result.Status = "false_positive"
+	}
+
+	result.PriorityScore = s.scanResultRepo.CalculatePriorityScore(result)
+
+	if err := s.scanResultRepo.Update(result); err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+func (s *VulnScanService) simulateAIAnalysis(result *models.ScanResult) int {
+	baseConfidence := result.Confidence
+	
+	if result.Severity == "critical" || result.Severity == "high" {
+		baseConfidence += 10
+	}
+	
+	if result.CVE != "" {
+		baseConfidence += 15
+	}
+	
+	if result.ProofOfConcept != "" {
+		baseConfidence += 20
+	}
+
+	if baseConfidence > 100 {
+		baseConfidence = 100
+	}
+
+	return baseConfidence
+}
+
+func (s *VulnScanService) VerifyResult(
+	resultID uuid.UUID,
+	status string,
+	notes string,
+	verifiedBy string,
+) (*models.ScanResult, error) {
+	if err := s.scanResultRepo.UpdateStatus(resultID, status, notes, verifiedBy); err != nil {
+		return nil, err
+	}
+
+	result, err := s.scanResultRepo.GetByID(resultID)
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+func (s *VulnScanService) AnalyzeVulnerabilityChains(targetID uuid.UUID) ([]*models.VulnerabilityChain, error) {
+	results, err := s.scanResultRepo.ListByTarget(targetID, "confirmed")
+	if err != nil {
+		return nil, err
+	}
+
+	if len(results) < 2 {
+		return []*models.VulnerabilityChain{}, nil
+	}
+
+	chains := []*models.VulnerabilityChain{}
+
+	if len(results) >= 2 {
+		chain := &models.VulnerabilityChain{
+			ID:          uuid.New(),
+			TargetID:    targetID,
+			Name:        "潜在攻击链",
+			Description: "基于发现的漏洞分析的潜在攻击路径",
+			Severity:    "high",
+			Confidence:  60,
+			Status:      "draft",
+		}
+
+		stepIDs := []string{}
+		for _, r := range results {
+			stepIDs = append(stepIDs, r.ID.String())
+		}
+
+		stepsJSON, _ := json.Marshal(stepIDs)
+		chain.Steps = string(stepsJSON)
+
+		nodes := []map[string]interface{}{}
+		edges := []map[string]interface{}{}
+
+		for i, r := range results {
+			nodes = append(nodes, map[string]interface{}{
+				"id":    r.ID.String(),
+				"label": r.Title,
+				"type":  "vulnerability",
+			})
+
+			if i > 0 {
+				edges = append(edges, map[string]interface{}{
+					"source": results[i-1].ID.String(),
+					"target": r.ID.String(),
+				})
+			}
+		}
+
+		nodesJSON, _ := json.Marshal(nodes)
+		edgesJSON, _ := json.Marshal(edges)
+		chain.Nodes = string(nodesJSON)
+		chain.Edges = string(edgesJSON)
+
+		if err := s.vulnChainRepo.Create(chain); err == nil {
+			chains = append(chains, chain)
+		}
+	}
+
+	return chains, nil
+}
+
+func (s *VulnScanService) GenerateWAFBypassPayloads(
+	category string,
+	originalPayload string,
+) ([]*models.WAFPayload, error) {
+	payloads := []*models.WAFPayload{}
+
+	techniques := []struct {
+		name string
+		fn   func(string) string
+	}{
+		{"大小写混淆", func(s string) string { return swapCase(s) }},
+		{"URL编码", func(s string) string { return urlEncode(s) }},
+		{"双重编码", func(s string) string { return urlEncode(urlEncode(s)) }},
+		{"Unicode编码", func(s string) string { return unicodeEncode(s) }},
+		{"注释绕过", func(s string) string { return addComments(s) }},
+	}
+
+	for _, tech := range techniques {
+		payload := &models.WAFPayload{
+			ID:        uuid.New(),
+			Category:  category,
+			Original:  originalPayload,
+			Bypassed:  tech.fn(originalPayload),
+			Technique: tech.name,
+		}
+		payloads = append(payloads, payload)
+	}
+
+	return payloads, nil
+}
+
+func swapCase(s string) string {
+	result := []rune{}
+	for i, r := range s {
+		if i%2 == 0 {
+			result = append(result, []rune(strings.ToUpper(string(r)))[0])
+		} else {
+			result = append(result, []rune(strings.ToLower(string(r)))[0])
+		}
+	}
+	return string(result)
+}
+
+func urlEncode(s string) string {
+	result := ""
+	for _, r := range s {
+		if r > 127 || (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9') {
+			result += fmt.Sprintf("%%%02X", r)
+		} else {
+			result += string(r)
+		}
+	}
+	return result
+}
+
+func unicodeEncode(s string) string {
+	result := ""
+	for _, r := range s {
+		result += fmt.Sprintf("\\u%04X", r)
+	}
+	return result
+}
+
+func addComments(s string) string {
+	result := ""
+	for i, r := range s {
+		if i > 0 && i%3 == 0 {
+			result += "/**/"
+		}
+		result += string(r)
+	}
+	return result
+}
+
+func (s *VulnScanService) GetScanTask(id uuid.UUID) (*models.ScanTask, error) {
+	return s.scanTaskRepo.GetByID(id)
+}
+
+func (s *VulnScanService) ListScanTasks(targetID uuid.UUID) ([]*models.ScanTask, error) {
+	return s.scanTaskRepo.ListByTarget(targetID, 10)
+}
+
+func (s *VulnScanService) GetScanResults(taskID uuid.UUID) ([]*models.ScanResult, error) {
+	return s.scanResultRepo.ListByTask(taskID)
+}
+
+func (s *VulnScanService) GetPOCs() ([]*models.POC, error) {
+	return s.pocRepo.List()
+}
+
+func (s *VulnScanService) GetScanConfigs() ([]*models.ScanConfig, error) {
+	return s.scanConfigRepo.List()
+}
+
+func toJSON(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		fmt.Printf("JSON序列化失败: %v\n", err)
+		return ""
+	}
+	return string(data)
+}

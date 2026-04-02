@@ -1,0 +1,503 @@
+package repository
+
+import (
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"gorm.io/gorm"
+)
+
+type POCRepository struct {
+	db *gorm.DB
+}
+
+func NewPOCRepository(db *gorm.DB) *POCRepository {
+	return &POCRepository{db: db}
+}
+
+func (r *POCRepository) Create(poc *models.POC) error {
+	return r.db.Create(poc).Error
+}
+
+func (r *POCRepository) GetByID(id uuid.UUID) (*models.POC, error) {
+	var poc models.POC
+	err := r.db.First(&poc, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &poc, nil
+}
+
+func (r *POCRepository) GetByName(name string) (*models.POC, error) {
+	var poc models.POC
+	err := r.db.First(&poc, "name = ?", name).Error
+	if err != nil {
+		return nil, err
+	}
+	return &poc, nil
+}
+
+func (r *POCRepository) List() ([]*models.POC, error) {
+	var pocs []*models.POC
+	err := r.db.Where("enabled = ?", true).Order("severity DESC, created_at DESC").Find(&pocs).Error
+	return pocs, err
+}
+
+func (r *POCRepository) ListBySeverity(severity string) ([]*models.POC, error) {
+	var pocs []*models.POC
+	err := r.db.Where("enabled = ? AND severity = ?", true, severity).
+		Order("created_at DESC").Find(&pocs).Error
+	return pocs, err
+}
+
+func (r *POCRepository) ListByCategory(category string) ([]*models.POC, error) {
+	var pocs []*models.POC
+	err := r.db.Where("enabled = ? AND category = ?", true, category).
+		Order("severity DESC, created_at DESC").Find(&pocs).Error
+	return pocs, err
+}
+
+func (r *POCRepository) ListByTags(tags []string) ([]*models.POC, error) {
+	var pocs []*models.POC
+	query := r.db.Where("enabled = ?", true)
+	
+	for _, tag := range tags {
+		query = query.Where("tags LIKE ?", "%"+tag+"%")
+	}
+	
+	err := query.Order("severity DESC, created_at DESC").Find(&pocs).Error
+	return pocs, err
+}
+
+func (r *POCRepository) MatchByFingerprint(fingerprint string) ([]*models.POC, error) {
+	var pocs []*models.POC
+	
+	if fingerprint == "" {
+		return r.List()
+	}
+	
+	err := r.db.Where("enabled = ? AND (fingerprint LIKE ? OR fingerprint = '')", true, "%"+fingerprint+"%").
+		Order("severity DESC, created_at DESC").Find(&pocs).Error
+	return pocs, err
+}
+
+func (r *POCRepository) Update(poc *models.POC) error {
+	poc.UpdatedAt = time.Now()
+	return r.db.Save(poc).Error
+}
+
+func (r *POCRepository) Delete(id uuid.UUID) error {
+	return r.db.Delete(&models.POC{}, "id = ?", id).Error
+}
+
+func (r *POCRepository) ImportFromNuclei(templates []*models.NucleiTemplate) error {
+	for _, tpl := range templates {
+		existing, _ := r.GetByName(tpl.TemplateID)
+		if existing != nil {
+			continue
+		}
+
+		poc := &models.POC{
+			ID:          uuid.New(),
+			Name:        tpl.TemplateID,
+			DisplayName: tpl.Name,
+			Severity:    tpl.Severity,
+			Tags:        tpl.Tags,
+			Author:      tpl.Author,
+			POCType:     "nuclei",
+			Format:      "yaml",
+			Content:     tpl.Content,
+			Hash:        tpl.Hash,
+			IsPublic:    true,
+			Enabled:     true,
+		}
+
+		if err := r.Create(poc); err != nil {
+			return err
+		}
+
+		tpl.POCID = &poc.ID
+	}
+	return nil
+}
+
+type ScanConfigRepository struct {
+	db *gorm.DB
+}
+
+func NewScanConfigRepository(db *gorm.DB) *ScanConfigRepository {
+	return &ScanConfigRepository{db: db}
+}
+
+func (r *ScanConfigRepository) InitializeDefaultConfigs() error {
+	defaultConfigs := []*models.ScanConfig{
+		{
+			ID:               uuid.New(),
+			Name:             "快速扫描",
+			Description:      "仅扫描高危和严重漏洞，速度快",
+			Mode:             "fast",
+			Concurrency:      10,
+			SeverityFilter:   "critical,high",
+			EnableAI:         false,
+			EnableAutoVerify: true,
+			IsDefault:        true,
+		},
+		{
+			ID:               uuid.New(),
+			Name:             "深度扫描",
+			Description:      "扫描所有漏洞，更全面但较慢",
+			Mode:             "deep",
+			Concurrency:      5,
+			SeverityFilter:   "",
+			EnableAI:         true,
+			EnableAutoVerify: true,
+			IsDefault:        false,
+		},
+		{
+			ID:               uuid.New(),
+			Name:             "AI增强扫描",
+			Description:      "AI辅助的智能扫描，误报过滤和验证",
+			Mode:             "custom",
+			Concurrency:      3,
+			SeverityFilter:   "",
+			EnableAI:         true,
+			EnableAutoVerify: true,
+			IsDefault:        false,
+		},
+	}
+
+	for _, config := range defaultConfigs {
+		existing, _ := r.GetByName(config.Name)
+		if existing == nil {
+			if err := r.Create(config); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (r *ScanConfigRepository) Create(config *models.ScanConfig) error {
+	return r.db.Create(config).Error
+}
+
+func (r *ScanConfigRepository) GetByID(id uuid.UUID) (*models.ScanConfig, error) {
+	var config models.ScanConfig
+	err := r.db.First(&config, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &config, nil
+}
+
+func (r *ScanConfigRepository) GetByName(name string) (*models.ScanConfig, error) {
+	var config models.ScanConfig
+	err := r.db.First(&config, "name = ?", name).Error
+	if err != nil {
+		return nil, err
+	}
+	return &config, nil
+}
+
+func (r *ScanConfigRepository) GetDefault() (*models.ScanConfig, error) {
+	var config models.ScanConfig
+	err := r.db.First(&config, "is_default = ?", true).Error
+	if err != nil {
+		return nil, err
+	}
+	return &config, nil
+}
+
+func (r *ScanConfigRepository) List() ([]*models.ScanConfig, error) {
+	var configs []*models.ScanConfig
+	err := r.db.Order("is_default DESC, name").Find(&configs).Error
+	return configs, err
+}
+
+func (r *ScanConfigRepository) Update(config *models.ScanConfig) error {
+	config.UpdatedAt = time.Now()
+	return r.db.Save(config).Error
+}
+
+func (r *ScanConfigRepository) Delete(id uuid.UUID) error {
+	return r.db.Delete(&models.ScanConfig{}, "id = ?", id).Error
+}
+
+type ScanTaskRepository struct {
+	db *gorm.DB
+}
+
+func NewScanTaskRepository(db *gorm.DB) *ScanTaskRepository {
+	return &ScanTaskRepository{db: db}
+}
+
+func (r *ScanTaskRepository) Create(task *models.ScanTask) error {
+	return r.db.Create(task).Error
+}
+
+func (r *ScanTaskRepository) GetByID(id uuid.UUID) (*models.ScanTask, error) {
+	var task models.ScanTask
+	err := r.db.Preload("Target").Preload("Config").Preload("Results").
+		First(&task, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
+func (r *ScanTaskRepository) ListByTarget(targetID uuid.UUID, limit int) ([]*models.ScanTask, error) {
+	var tasks []*models.ScanTask
+	query := r.db.Where("target_id = ?", targetID).
+		Preload("Results").
+		Order("created_at DESC")
+	
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	
+	err := query.Find(&tasks).Error
+	return tasks, err
+}
+
+func (r *ScanTaskRepository) ListActive() ([]*models.ScanTask, error) {
+	var tasks []*models.ScanTask
+	err := r.db.Where("status IN ?", []string{"pending", "running"}).
+		Preload("Target").
+		Order("created_at ASC").Find(&tasks).Error
+	return tasks, err
+}
+
+func (r *ScanTaskRepository) Update(task *models.ScanTask) error {
+	task.UpdatedAt = time.Now()
+	return r.db.Save(task).Error
+}
+
+func (r *ScanTaskRepository) UpdateStatus(id uuid.UUID, status string, progress int, message string) error {
+	updates := map[string]interface{}{
+		"status":     status,
+		"progress":   progress,
+		"message":    message,
+		"updated_at": time.Now(),
+	}
+	
+	if status == "running" {
+		now := time.Now()
+		updates["started_at"] = &now
+	} else if status == "completed" || status == "failed" || status == "cancelled" {
+		now := time.Now()
+		updates["completed_at"] = &now
+	}
+	
+	return r.db.Model(&models.ScanTask{}).Where("id = ?", id).Updates(updates).Error
+}
+
+func (r *ScanTaskRepository) IncrementFoundVulns(id uuid.UUID) error {
+	return r.db.Model(&models.ScanTask{}).
+		Where("id = ?", id).
+		UpdateColumn("found_vulns", gorm.Expr("found_vulns + 1")).Error
+}
+
+func (r *ScanTaskRepository) Delete(id uuid.UUID) error {
+	return r.db.Delete(&models.ScanTask{}, "id = ?", id).Error
+}
+
+type ScanResultRepository struct {
+	db *gorm.DB
+}
+
+func NewScanResultRepository(db *gorm.DB) *ScanResultRepository {
+	return &ScanResultRepository{db: db}
+}
+
+func (r *ScanResultRepository) Create(result *models.ScanResult) error {
+	return r.db.Create(result).Error
+}
+
+func (r *ScanResultRepository) GetByID(id uuid.UUID) (*models.ScanResult, error) {
+	var result models.ScanResult
+	err := r.db.Preload("Task").Preload("POC").First(&result, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (r *ScanResultRepository) ListByTask(taskID uuid.UUID) ([]*models.ScanResult, error) {
+	var results []*models.ScanResult
+	err := r.db.Where("task_id = ?", taskID).
+		Order("priority_score DESC, severity DESC, created_at DESC").Find(&results).Error
+	return results, err
+}
+
+func (r *ScanResultRepository) ListByTarget(targetID uuid.UUID, statusFilter string) ([]*models.ScanResult, error) {
+	var results []*models.ScanResult
+	query := r.db.Where("target_id = ?", targetID)
+	
+	if statusFilter != "" {
+		query = query.Where("status = ?", statusFilter)
+	}
+	
+	err := query.Order("priority_score DESC, severity DESC, created_at DESC").Find(&results).Error
+	return results, err
+}
+
+func (r *ScanResultRepository) FindDuplicate(taskID uuid.UUID, title string, url string) (*models.ScanResult, error) {
+	var result models.ScanResult
+	err := r.db.First(&result, "task_id = ? AND title = ? AND url = ?", taskID, title, url).Error
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+func (r *ScanResultRepository) Update(result *models.ScanResult) error {
+	result.UpdatedAt = time.Now()
+	return r.db.Save(result).Error
+}
+
+func (r *ScanResultRepository) UpdateStatus(id uuid.UUID, status string, notes string, verifiedBy string) error {
+	updates := map[string]interface{}{
+		"status":     status,
+		"notes":      notes,
+		"updated_at": time.Now(),
+	}
+	
+	if status == "verified" || status == "confirmed" {
+		now := time.Now()
+		updates["verified_at"] = &now
+		updates["verified_by"] = verifiedBy
+	}
+	
+	return r.db.Model(&models.ScanResult{}).Where("id = ?", id).Updates(updates).Error
+}
+
+func (r *ScanResultRepository) CalculatePriorityScore(result *models.ScanResult) float64 {
+	score := 0.0
+
+	severityScore := map[string]float64{
+		"critical": 40.0,
+		"high":     30.0,
+		"medium":   20.0,
+		"low":      10.0,
+		"info":      5.0,
+	}
+	score += severityScore[result.Severity]
+
+	if result.CVSS > 0 {
+		score += result.CVSS * 2.0
+	}
+
+	if result.Confidence > 0 {
+		score += float64(result.Confidence) * 0.2
+	}
+
+	if result.AIConfidence > 0 {
+		score += float64(result.AIConfidence) * 0.3
+	}
+
+	if result.CVE != "" {
+		score += 10.0
+	}
+
+	if result.Tags != "" {
+		tags := strings.Split(result.Tags, ",")
+		score += float64(len(tags)) * 2.0
+	}
+
+	return score
+}
+
+func (r *ScanResultRepository) Delete(id uuid.UUID) error {
+	return r.db.Delete(&models.ScanResult{}, "id = ?", id).Error
+}
+
+type VulnerabilityChainRepository struct {
+	db *gorm.DB
+}
+
+func NewVulnerabilityChainRepository(db *gorm.DB) *VulnerabilityChainRepository {
+	return &VulnerabilityChainRepository{db: db}
+}
+
+func (r *VulnerabilityChainRepository) Create(chain *models.VulnerabilityChain) error {
+	return r.db.Create(chain).Error
+}
+
+func (r *VulnerabilityChainRepository) GetByID(id uuid.UUID) (*models.VulnerabilityChain, error) {
+	var chain models.VulnerabilityChain
+	err := r.db.First(&chain, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &chain, nil
+}
+
+func (r *VulnerabilityChainRepository) ListByTarget(targetID uuid.UUID) ([]*models.VulnerabilityChain, error) {
+	var chains []*models.VulnerabilityChain
+	err := r.db.Where("target_id = ?", targetID).
+		Order("confidence DESC, created_at DESC").Find(&chains).Error
+	return chains, err
+}
+
+func (r *VulnerabilityChainRepository) Update(chain *models.VulnerabilityChain) error {
+	chain.UpdatedAt = time.Now()
+	return r.db.Save(chain).Error
+}
+
+func (r *VulnerabilityChainRepository) Delete(id uuid.UUID) error {
+	return r.db.Delete(&models.VulnerabilityChain{}, "id = ?", id).Error
+}
+
+type NucleiTemplateRepository struct {
+	db *gorm.DB
+}
+
+func NewNucleiTemplateRepository(db *gorm.DB) *NucleiTemplateRepository {
+	return &NucleiTemplateRepository{db: db}
+}
+
+func (r *NucleiTemplateRepository) Create(tpl *models.NucleiTemplate) error {
+	return r.db.Create(tpl).Error
+}
+
+func (r *NucleiTemplateRepository) GetByID(id uuid.UUID) (*models.NucleiTemplate, error) {
+	var tpl models.NucleiTemplate
+	err := r.db.First(&tpl, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &tpl, nil
+}
+
+func (r *NucleiTemplateRepository) GetByTemplateID(templateID string) (*models.NucleiTemplate, error) {
+	var tpl models.NucleiTemplate
+	err := r.db.First(&tpl, "template_id = ?", templateID).Error
+	if err != nil {
+		return nil, err
+	}
+	return &tpl, nil
+}
+
+func (r *NucleiTemplateRepository) List() ([]*models.NucleiTemplate, error) {
+	var tpls []*models.NucleiTemplate
+	err := r.db.Where("enabled = ?", true).Order("severity DESC").Find(&tpls).Error
+	return tpls, err
+}
+
+func (r *NucleiTemplateRepository) ListBySeverity(severity string) ([]*models.NucleiTemplate, error) {
+	var tpls []*models.NucleiTemplate
+	err := r.db.Where("enabled = ? AND severity = ?", true, severity).Find(&tpls).Error
+	return tpls, err
+}
+
+func (r *NucleiTemplateRepository) Update(tpl *models.NucleiTemplate) error {
+	tpl.UpdatedAt = time.Now()
+	return r.db.Save(tpl).Error
+}
+
+func (r *NucleiTemplateRepository) Delete(id uuid.UUID) error {
+	return r.db.Delete(&models.NucleiTemplate{}, "id = ?", id).Error
+}

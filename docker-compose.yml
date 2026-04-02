@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: lieying-postgres
+    environment:
+      POSTGRES_USER: lieying
+      POSTGRES_PASSWORD: lieying123
+      POSTGRES_DB: lieying_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - lieying-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: lieying-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - lieying-network
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: lieying-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - lieying-network
+
+  engine:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.engine
+    container_name: lieying-engine
+    depends_on:
+      - postgres
+      - redis
+      - rabbitmq
+    ports:
+      - "8080:8080"
+    networks:
+      - lieying-network
+    restart: unless-stopped
+
+  platform:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.platform
+    container_name: lieying-platform
+    depends_on:
+      - postgres
+      - redis
+      - engine
+    ports:
+      - "9090:9090"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    networks:
+      - lieying-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
+
+networks:
+  lieying-network:
+    driver: bridge

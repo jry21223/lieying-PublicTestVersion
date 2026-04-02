@@ -1,0 +1,299 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"github.com/kunlun-sec/lunying/internal/service"
+)
+
+// ReportGeneratorHandler 报告生成API处理器
+type ReportGeneratorHandler struct {
+	reportService *service.ReportGeneratorService
+}
+
+func NewReportGeneratorHandler(reportService *service.ReportGeneratorService) *ReportGeneratorHandler {
+	return &ReportGeneratorHandler{
+		reportService: reportService,
+	}
+}
+
+func (h *ReportGeneratorHandler) RegisterRoutes(mux *http.ServeMux) {
+	// 模板管理
+	mux.HandleFunc("/api/report/templates", h.handleTemplates)
+	mux.HandleFunc("/api/report/templates/", h.handleTemplate)
+	
+	// 草稿管理
+	mux.HandleFunc("/api/report/drafts", h.handleDrafts)
+	mux.HandleFunc("/api/report/drafts/", h.handleDraft)
+	
+	// 版本历史
+	mux.HandleFunc("/api/report/drafts/", h.handleVersions)
+	
+	// 漏洞排序
+	mux.HandleFunc("/api/report/drafts/", h.handleVulnOrders)
+	
+	// 报告生成和导出
+	mux.HandleFunc("/api/report/generate", h.handleGenerate)
+	mux.HandleFunc("/api/report/exports", h.handleExports)
+}
+
+// ==================== 模板管理 ====================
+
+func (h *ReportGeneratorHandler) handleTemplates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+
+	templateType := r.URL.Query().Get("type")
+	builtinStr := r.URL.Query().Get("builtin")
+	
+	var onlyBuiltin *bool
+	if builtinStr != "" {
+		b, _ := strconv.ParseBool(builtinStr)
+		onlyBuiltin = &b
+	}
+
+	templates, err := h.reportService.reportRepo.ListTemplates(templateType, onlyBuiltin)
+	if err != nil {
+		http.Error(w, "获取模板列表失败", http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, templates)
+}
+
+func (h *ReportGeneratorHandler) handleTemplate(w http.ResponseWriter, r *http.Request) {
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/report/templates/")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		http.Error(w, "无效的ID", http.StatusBadRequest)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+
+	template, err := h.reportService.reportRepo.GetTemplate(id)
+	if err != nil {
+		http.Error(w, "模板不存在", http.StatusNotFound)
+		return
+	}
+
+	respondJSON(w, template)
+}
+
+// ==================== 草稿管理 ====================
+
+func (h *ReportGeneratorHandler) handleDrafts(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		h.listDrafts(w, r)
+	case http.MethodPost:
+		h.createDraft(w, r)
+	default:
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *ReportGeneratorHandler) listDrafts(w http.ResponseWriter, r *http.Request) {
+	status := r.URL.Query().Get("status")
+	drafts, err := h.reportService.reportRepo.ListDrafts(status)
+	if err != nil {
+		http.Error(w, "获取草稿列表失败", http.StatusInternalServerError)
+		return
+	}
+	respondJSON(w, drafts)
+}
+
+func (h *ReportGeneratorHandler) createDraft(w http.ResponseWriter, r *http.Request) {
+	var draft models.ReportDraft
+	if err := json.NewDecoder(r.Body).Decode(&draft); err != nil {
+		http.Error(w, "请求参数错误", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.reportService.reportRepo.CreateDraft(&draft); err != nil {
+		http.Error(w, "创建草稿失败", http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, draft)
+}
+
+func (h *ReportGeneratorHandler) handleDraft(w http.ResponseWriter, r *http.Request) {
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/report/drafts/")
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		http.Error(w, "无效的ID", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		draft, err := h.reportService.reportRepo.GetDraft(id)
+		if err != nil {
+			http.Error(w, "草稿不存在", http.StatusNotFound)
+			return
+		}
+		respondJSON(w, draft)
+	case http.MethodPut:
+		var draft models.ReportDraft
+		if err := json.NewDecoder(r.Body).Decode(&draft); err != nil {
+			http.Error(w, "请求参数错误", http.StatusBadRequest)
+			return
+		}
+		draft.ID = id
+		if err := h.reportService.reportRepo.UpdateDraft(&draft); err != nil {
+			http.Error(w, "更新草稿失败", http.StatusInternalServerError)
+			return
+		}
+		respondJSON(w, draft)
+	case http.MethodDelete:
+		if err := h.reportService.reportRepo.DeleteDraft(id); err != nil {
+			http.Error(w, "删除草稿失败", http.StatusInternalServerError)
+			return
+		}
+		respondJSON(w, map[string]string{"message": "删除成功"})
+	default:
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+	}
+}
+
+// ==================== 版本历史 ====================
+
+func (h *ReportGeneratorHandler) handleVersions(w http.ResponseWriter, r *http.Request) {
+	if !strings.Contains(r.URL.Path, "/versions") {
+		return
+	}
+
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) < 5 {
+		http.Error(w, "无效的路径", http.StatusBadRequest)
+		return
+	}
+
+	reportID, err := uuid.Parse(parts[4])
+	if err != nil {
+		http.Error(w, "无效的报告ID", http.StatusBadRequest)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+
+	versions, err := h.reportService.reportRepo.ListVersions(reportID)
+	if err != nil {
+		http.Error(w, "获取版本历史失败", http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, versions)
+}
+
+// ==================== 漏洞排序 ====================
+
+func (h *ReportGeneratorHandler) handleVulnOrders(w http.ResponseWriter, r *http.Request) {
+	if !strings.Contains(r.URL.Path, "/vuln-orders") {
+		return
+	}
+
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) < 5 {
+		http.Error(w, "无效的路径", http.StatusBadRequest)
+		return
+	}
+
+	reportID, err := uuid.Parse(parts[4])
+	if err != nil {
+		http.Error(w, "无效的报告ID", http.StatusBadRequest)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		orders, err := h.reportService.reportRepo.ListVulnOrders(reportID)
+		if err != nil {
+			http.Error(w, "获取漏洞排序失败", http.StatusInternalServerError)
+			return
+		}
+		respondJSON(w, orders)
+	case http.MethodPut:
+		var orders []models.ReportVulnOrder
+		if err := json.NewDecoder(r.Body).Decode(&orders); err != nil {
+			http.Error(w, "请求参数错误", http.StatusBadRequest)
+			return
+		}
+		if err := h.reportService.reportRepo.UpdateVulnOrders(reportID, orders); err != nil {
+			http.Error(w, "更新漏洞排序失败", http.StatusInternalServerError)
+			return
+		}
+		respondJSON(w, map[string]string{"message": "更新成功"})
+	default:
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+	}
+}
+
+// ==================== 报告生成 ====================
+
+func (h *ReportGeneratorHandler) handleGenerate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req service.GenerateReportRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "请求参数错误", http.StatusBadRequest)
+		return
+	}
+
+	filePath, err := h.reportService.GenerateReport(&req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, map[string]string{
+		"file_path": filePath,
+		"message":   "报告生成成功",
+	})
+}
+
+// ==================== 导出记录 ====================
+
+func (h *ReportGeneratorHandler) handleExports(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "方法不允许", http.StatusMethodNotAllowed)
+		return
+	}
+
+	reportIDStr := r.URL.Query().Get("report_id")
+	if reportIDStr == "" {
+		http.Error(w, "缺少报告ID", http.StatusBadRequest)
+		return
+	}
+
+	reportID, err := uuid.Parse(reportIDStr)
+	if err != nil {
+		http.Error(w, "无效的报告ID", http.StatusBadRequest)
+		return
+	}
+
+	exports, err := h.reportService.reportRepo.ListExports(reportID)
+	if err != nil {
+		http.Error(w, "获取导出记录失败", http.StatusInternalServerError)
+		return
+	}
+
+	respondJSON(w, exports)
+}

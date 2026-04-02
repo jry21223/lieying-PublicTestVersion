@@ -1,0 +1,57 @@
+network:
+  proxy:
+    enabled: false
+    type: "http"
+    host: "127.0.0.1"
+    port: 8080
+    username: ""
+    password: ""
+
+  concurrency: 10
+  qps: 50
+  timeout: 30
+  retries: 3
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  follow_redirects: true
+  skip_tls_verify: false
+
+database:
+  type: "sqlite"
+  path: "~/.lieying/lieying.db"
+
+tools:
+  nuclei:
+    path: "nuclei"
+    templates_dir: ""
+    tags: []
+  amass:
+    path: "amass"
+    config: ""
+  subfinder:
+    path: "subfinder"
+    config: ""
+  nmap:
+    path: "nmap"
+  ffuf:
+    path: "ffuf"
+  masscan:
+    path: "masscan"
+
+ai:
+  provider: "ollama"
+  api_url: "http://localhost:11434"
+  api_key: ""
+  model: "llama2"
+  temperature: 0.7
+
+logging:
+  level: "info"
+  file: "~/.lieying/logs/lieying.log"
+  max_size: 100
+  max_backups: 3
+  max_age: 30
+
+scan:
+  default_timeout: 300
+  max_concurrent_tasks: 5
+  auto_save_interval: 30

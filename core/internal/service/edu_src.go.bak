@@ -1,0 +1,391 @@
+package service
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"github.com/kunlun-sec/lunying/internal/repository"
+)
+
+// EduSRCService 教育SRC服务
+type EduSRCService struct {
+	eduRepo *repository.EduSRCRepository
+	httpClient *http.Client
+}
+
+func NewEduSRCService(eduRepo *repository.EduSRCRepository) *EduSRCService {
+	return &EduSRCService{
+		eduRepo: eduRepo,
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+}
+
+// ==================== 指纹识别服务 ====================
+
+// FingerprintMatchResult 指纹匹配结果
+type FingerprintMatchResult struct {
+	SystemType string  `json:"system_type"`
+	Name       string  `json:"name"`
+	Confidence float64 `json:"confidence"`
+	MatchedBy  string  `json:"matched_by"`
+}
+
+// IdentifySystem 识别教务系统类型
+func (s *EduSRCService) IdentifySystem(url string) (*FingerprintMatchResult, error) {
+	fingerprints, err := s.eduRepo.ListFingerprints("")
+	if err != nil {
+		return nil, fmt.Errorf("获取指纹库失败: %w", err)
+	}
+
+	resp, err := s.httpClient.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("请求目标失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	bodyStr := string(body)
+	title := extractTitle(bodyStr)
+	cookies := extractCookies(resp.Header)
+
+	var bestMatch *FingerprintMatchResult
+	maxConfidence := 0.0
+
+	for _, fp := range fingerprints {
+		confidence := 0.0
+		matchedBy := ""
+
+		if fp.URLPatterns != "" {
+			var patterns []string
+			json.Unmarshal([]byte(fp.URLPatterns), &patterns)
+			for _, p := range patterns {
+				if strings.Contains(url, p) {
+					confidence += 0.3
+					matchedBy = "url"
+					break
+				}
+			}
+		}
+
+		if fp.TitlePatterns != "" {
+			var patterns []string
+			json.Unmarshal([]byte(fp.TitlePatterns), &patterns)
+			for _, p := range patterns {
+				if strings.Contains(title, p) {
+					confidence += 0.4
+					matchedBy = "title"
+					break
+				}
+			}
+		}
+
+		if fp.CookieKeys != "" {
+			var keys []string
+			json.Unmarshal([]byte(fp.CookieKeys), &keys)
+			for _, k := range keys {
+				if _, ok := cookies[k]; ok {
+					confidence += 0.2
+					matchedBy = "cookie"
+					break
+				}
+			}
+		}
+
+		if fp.JSKeywords != "" {
+			var keywords []string
+			json.Unmarshal([]byte(fp.JSKeywords), &keywords)
+			for _, kw := range keywords {
+				if strings.Contains(bodyStr, kw) {
+					confidence += 0.1
+					matchedBy = "js"
+					break
+				}
+			}
+		}
+
+		if confidence > maxConfidence && confidence > 0.3 {
+			maxConfidence = confidence
+			bestMatch = &FingerprintMatchResult{
+				SystemType: fp.SystemType,
+				Name:       fp.Name,
+				Confidence: confidence,
+				MatchedBy:  matchedBy,
+			}
+		}
+	}
+
+	return bestMatch, nil
+}
+
+func extractTitle(html string) string {
+	re := regexp.MustCompile(`<title[^>]*>([^<]+)</title>`)
+	matches := re.FindStringSubmatch(html)
+	if len(matches) > 1 {
+		return strings.TrimSpace(matches[1])
+	}
+	return ""
+}
+
+func extractCookies(header http.Header) map[string]bool {
+	cookies := make(map[string]bool)
+	for _, c := range header.Values("Set-Cookie") {
+		parts := strings.SplitN(c, "=", 2)
+		if len(parts) > 0 {
+			cookies[strings.TrimSpace(parts[0])] = true
+		}
+	}
+	return cookies
+}
+
+// ==================== POC匹配和执行 ====================
+
+// POCRunResult POC运行结果
+type POCRunResult struct {
+	POCID      uuid.UUID `json:"poc_id"`
+	Name       string    `json:"name"`
+	VulnType   string    `json:"vuln_type"`
+	Severity   string    `json:"severity"`
+	Success    bool      `json:"success"`
+	Message    string    `json:"message"`
+	Request    string    `json:"request"`
+	Response   string    `json:"response"`
+}
+
+// MatchPOCs 匹配适用的POC
+func (s *EduSRCService) MatchPOCs(systemType string) ([]models.EduPOC, error) {
+	return s.eduRepo.ListEduPOCs(systemType, "", &[]bool{true}[0])
+}
+
+// ExecutePOC 执行单个POC
+func (s *EduSRCService) ExecutePOC(targetURL string, poc *models.EduPOC) (*POCRunResult, error) {
+	result := &POCRunResult{
+		POCID:    poc.ID,
+		Name:     poc.Name,
+		VulnType: poc.VulnType,
+		Severity: poc.Severity,
+		Success:  false,
+	}
+
+	req, err := http.NewRequest("GET", targetURL+poc.Payload, nil)
+	if err != nil {
+		result.Message = fmt.Sprintf("构造请求失败: %v", err)
+		return result, nil
+	}
+
+	result.Request = fmt.Sprintf("%s %s", req.Method, req.URL.String())
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		result.Message = fmt.Sprintf("请求失败: %v", err)
+		return result, nil
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	result.Response = string(body)
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if poc.VulnType == "SQL注入" && strings.Contains(result.Response, "error") ||
+			poc.VulnType == "信息泄露" && len(result.Response) > 1000 {
+			result.Success = true
+			result.Message = "漏洞疑似存在"
+		} else {
+			result.Message = "请求成功，需手动验证"
+		}
+	} else {
+		result.Message = fmt.Sprintf("HTTP状态码: %d", resp.StatusCode)
+	}
+
+	return result, nil
+}
+
+// ==================== 批量扫描服务 ====================
+
+// BatchScanConfig 批量扫描配置
+type BatchScanConfig struct {
+	Province    string   `json:"province"`
+	UniversityIDs []string `json:"university_ids"`
+	AutoPOC     bool     `json:"auto_poc"`
+}
+
+// StartBatchScan 启动批量扫描
+func (s *EduSRCService) StartBatchScan(config *BatchScanConfig) (*models.EduBatchTask, error) {
+	task := &models.EduBatchTask{
+		Name:         fmt.Sprintf("批量扫描 - %s", time.Now().Format("2006-01-02 15:04")),
+		Type:         "province_scan",
+		Status:       "running",
+		TargetCount:  0,
+		ScannedCount: 0,
+		VulnCount:    0,
+		Config:       toJSON(config),
+	}
+
+	var universities []models.University
+	if config.Province != "" {
+		uniList, _, _ := s.eduRepo.ListUniversities(1, 1000, config.Province, nil)
+		universities = uniList
+	} else {
+		for _, idStr := range config.UniversityIDs {
+			if id, err := uuid.Parse(idStr); err == nil {
+				if uni, err := s.eduRepo.GetUniversity(id); err == nil {
+					universities = append(universities, *uni)
+				}
+			}
+		}
+	}
+
+	task.TargetCount = len(universities)
+
+	if err := s.eduRepo.CreateBatchTask(task); err != nil {
+		return nil, err
+	}
+
+	go s.runBatchScan(task, universities, config)
+
+	return task, nil
+}
+
+func (s *EduSRCService) runBatchScan(task *models.EduBatchTask, universities []models.University, config *BatchScanConfig) {
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 5)
+
+	for _, uni := range universities {
+		wg.Add(1)
+		semaphore <- struct{}{}
+
+		go func(u models.University) {
+			defer wg.Done()
+			defer func() { <-semaphore }()
+
+			s.scanUniversity(task.ID, u, config)
+
+			task.ScannedCount++
+			s.eduRepo.UpdateBatchTask(task)
+		}(uni)
+	}
+
+	wg.Wait()
+	task.Status = "completed"
+	s.eduRepo.UpdateBatchTask(task)
+}
+
+func (s *EduSRCService) scanUniversity(taskID uuid.UUID, uni models.University, config *BatchScanConfig) {
+	logger.Info("扫描高校: %s", uni.Name)
+
+	var domains []string
+	if uni.Domains != "" {
+		json.Unmarshal([]byte(uni.Domains), &domains)
+	}
+
+	for _, domain := range domains {
+		url := "http://" + domain
+		match, err := s.IdentifySystem(url)
+		if err != nil || match == nil {
+			continue
+		}
+
+		eduSystem := &models.EduSystem{
+			UniversityID: uni.ID,
+			Name:         match.Name,
+			Type:         match.SystemType,
+			URL:          url,
+		}
+		s.eduRepo.CreateEduSystem(eduSystem)
+
+		if config.AutoPOC {
+			pocs, _ := s.MatchPOCs(match.SystemType)
+			for _, poc := range pocs {
+				result, _ := s.ExecutePOC(url, &poc)
+				if result.Success {
+					scanResult := &models.EduScanResult{
+						TaskID:       taskID,
+						UniversityID: uni.ID,
+						SystemID:     eduSystem.ID,
+						POCID:        poc.ID,
+						URL:          url,
+						SystemType:   match.SystemType,
+						VulnType:     poc.VulnType,
+						Severity:     poc.Severity,
+						Status:       "pending",
+						Request:      result.Request,
+						Response:     result.Response,
+					}
+					s.eduRepo.CreateScanResult(scanResult)
+					s.eduRepo.IncrementPOCHitCount(poc.ID)
+				}
+			}
+		}
+	}
+}
+
+// ==================== SRC提交服务 ====================
+
+// SubmissionData 提交数据
+type SubmissionData struct {
+	Title       string `json:"title"`
+	VulnType    string `json:"vuln_type"`
+	Impact      string `json:"impact"`
+	Reproduce   string `json:"reproduce"`
+	Repair      string `json:"repair"`
+	Description string `json:"description"`
+}
+
+// GenerateSubmission 生成SRC提交内容
+func (s *EduSRCService) GenerateSubmission(scanResultID uuid.UUID, templateID uuid.UUID) (*SubmissionData, error) {
+	scanResult, err := s.eduRepo.GetScanResult(scanResultID)
+	if err != nil {
+		return nil, fmt.Errorf("获取扫描结果失败: %w", err)
+	}
+
+	template, err := s.eduRepo.GetSubmissionTemplate(templateID)
+	if err != nil {
+		return nil, fmt.Errorf("获取模板失败: %w", err)
+	}
+
+	data := &SubmissionData{
+		Title:       fmt.Sprintf("[%s] %s", scanResult.Severity, scanResult.VulnType),
+		VulnType:    replaceVars(template.VulnTypeField, scanResult),
+		Impact:      replaceVars(template.ImpactField, scanResult),
+		Reproduce:   replaceVars(template.ReproduceField, scanResult),
+		Repair:      replaceVars(template.RepairField, scanResult),
+		Description: replaceVars(template.DescriptionField, scanResult),
+	}
+
+	return data, nil
+}
+
+func replaceVars(template string, result *models.EduScanResult) string {
+	t := template
+	t = strings.ReplaceAll(t, "{{url}}", result.URL)
+	t = strings.ReplaceAll(t, "{{vuln_type}}", result.VulnType)
+	t = strings.ReplaceAll(t, "{{severity}}", result.Severity)
+	t = strings.ReplaceAll(t, "{{system_type}}", result.SystemType)
+	t = strings.ReplaceAll(t, "{{request}}", result.Request)
+	t = strings.ReplaceAll(t, "{{response}}", result.Response)
+	return t
+}
+
+// ==================== 初始化 ====================
+
+func (s *EduSRCService) Initialize() error {
+	return s.eduRepo.InitializeDefaultData()
+}
+
+func toJSON(v interface{}) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}

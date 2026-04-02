@@ -1,0 +1,435 @@
+package service
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"github.com/kunlun-sec/lunying/internal/repository"
+	"github.com/kunlun-sec/lunying/pkg/logger"
+)
+
+// OllamaMessage Ollama消息格式
+type OllamaMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// OllamaChatRequest Ollama聊天请求
+type OllamaChatRequest struct {
+	Model    string          `json:"model"`
+	Messages []OllamaMessage `json:"messages"`
+	Stream   bool            `json:"stream"`
+	Options  map[string]interface{} `json:"options,omitempty"`
+}
+
+// OllamaChatResponse Ollama聊天响应
+type OllamaChatResponse struct {
+	Model     string        `json:"model"`
+	CreatedAt time.Time     `json:"created_at"`
+	Message   OllamaMessage `json:"message"`
+	Done      bool          `json:"done"`
+}
+
+// OpenAIChatMessage OpenAI消息格式
+type OpenAIChatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// OpenAIChatRequest OpenAI聊天请求
+type OpenAIChatRequest struct {
+	Model       string                  `json:"model"`
+	Messages    []OpenAIChatMessage     `json:"messages"`
+	Temperature float64                 `json:"temperature,omitempty"`
+	MaxTokens   int                     `json:"max_tokens,omitempty"`
+}
+
+// OpenAIChatResponse OpenAI聊天响应
+type OpenAIChatResponse struct {
+	Choices []struct {
+		Message OpenAIChatMessage `json:"message"`
+	} `json:"choices"`
+	Usage struct {
+		TotalTokens int `json:"total_tokens"`
+	} `json:"usage"`
+}
+
+// FunctionDefinition 工具函数定义
+type FunctionDefinition struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Parameters  map[string]interface{} `json:"parameters"`
+}
+
+// AIService AI助手服务
+type AIService struct {
+	aiRepo      *repository.AIRepository
+	assetRepo   *repository.AssetRepository
+	vulnRepo    *repository.VulnerabilityRepository
+}
+
+func NewAIService(
+	aiRepo *repository.AIRepository,
+	assetRepo *repository.AssetRepository,
+	vulnRepo *repository.VulnerabilityRepository,
+) *AIService {
+	return &AIService{
+		aiRepo:    aiRepo,
+		assetRepo: assetRepo,
+		vulnRepo:  vulnRepo,
+	}
+}
+
+// ==================== 配置管理 ====================
+
+func (s *AIService) GetConfig() (*models.AIConfig, error) {
+	return s.aiRepo.GetConfig()
+}
+
+func (s *AIService) UpdateConfig(config *models.AIConfig) error {
+	return s.aiRepo.UpdateConfig(config)
+}
+
+// ==================== 会话管理 ====================
+
+func (s *AIService) CreateSession(title string) (*models.ChatSession, error) {
+	session := &models.ChatSession{
+		Title: title,
+	}
+	if err := s.aiRepo.CreateSession(session); err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+func (s *AIService) GetSession(id uuid.UUID) (*models.ChatSession, error) {
+	return s.aiRepo.GetSession(id)
+}
+
+func (s *AIService) ListSessions() ([]models.ChatSession, error) {
+	return s.aiRepo.ListSessions()
+}
+
+func (s *AIService) DeleteSession(id uuid.UUID) error {
+	return s.aiRepo.DeleteSession(id)
+}
+
+// ==================== 聊天功能 ====================
+
+func (s *AIService) SendMessage(sessionID uuid.UUID, content string) (*models.ChatMessage, error) {
+	startTime := time.Now()
+
+	config, err := s.aiRepo.GetConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	userMessage := &models.ChatMessage{
+		SessionID: sessionID,
+		Role:      "user",
+		Content:   content,
+	}
+	if err := s.aiRepo.AddMessage(userMessage); err != nil {
+		return nil, err
+	}
+
+	messages, err := s.aiRepo.GetMessages(sessionID, 50)
+	if err != nil {
+		return nil, err
+	}
+
+	contextMessages := s.buildContext(messages, config)
+
+	var response string
+	var modelUsed string
+	var tokensUsed int
+
+	if config.Mode == models.AIModeLocal {
+		response, modelUsed, tokensUsed, err = s.callOllama(config, contextMessages)
+	} else {
+		response, modelUsed, tokensUsed, err = s.callOpenAI(config, contextMessages)
+	}
+
+	if err != nil {
+		logger.Error("AI调用失败: %v", err)
+		s.aiRepo.CreateLog(&models.AILog{
+			SessionID: sessionID,
+			Type:      "error",
+			Request:   content,
+			Error:     err.Error(),
+			Duration:  time.Since(startTime).Milliseconds(),
+		})
+		return nil, err
+	}
+
+	assistantMessage := &models.ChatMessage{
+		SessionID:  sessionID,
+		Role:       "assistant",
+		Content:    response,
+		TokensUsed: tokensUsed,
+		ModelUsed:  modelUsed,
+		DurationMs: time.Since(startTime).Milliseconds(),
+	}
+	if err := s.aiRepo.AddMessage(assistantMessage); err != nil {
+		return nil, err
+	}
+
+	s.aiRepo.CreateLog(&models.AILog{
+		SessionID: sessionID,
+		Type:      "response",
+		Request:   content,
+		Response:  response,
+		Duration:  time.Since(startTime).Milliseconds(),
+		Tokens:    tokensUsed,
+		Model:     modelUsed,
+	})
+
+	session, _ := s.aiRepo.GetSession(sessionID)
+	if session != nil {
+		session.MessageCount++
+		session.LastActiveAt = time.Now()
+		s.aiRepo.UpdateSession(session)
+	}
+
+	return assistantMessage, nil
+}
+
+func (s *AIService) buildContext(messages []models.ChatMessage, config *models.AIConfig) []OllamaMessage {
+	var result []OllamaMessage
+
+	if config.EnableContextAwareness {
+		contextInfo := s.buildContextInfo()
+		result = append(result, OllamaMessage{
+			Role:    "system",
+			Content: config.SystemPrompt + "\n\n当前项目上下文:\n" + contextInfo,
+		})
+	} else {
+		result = append(result, OllamaMessage{
+			Role:    "system",
+			Content: config.SystemPrompt,
+		})
+	}
+
+	for _, msg := range messages {
+		result = append(result, OllamaMessage{
+			Role:    msg.Role,
+			Content: msg.Content,
+		})
+	}
+
+	return result
+}
+
+func (s *AIService) buildContextInfo() string {
+	context := ""
+
+	if assets, err := s.assetRepo.ListAssets(); err == nil && len(assets) > 0 {
+		context += fmt.Sprintf("\n资产数量: %d", len(assets))
+		if len(assets) > 5 {
+			assets = assets[:5]
+		}
+		context += "\n最近发现的资产:"
+		for _, asset := range assets {
+			context += fmt.Sprintf("\n- %s (%s)", asset.Name, asset.Type)
+		}
+	}
+
+	if vulns, err := s.vulnRepo.ListVulnerabilities(); err == nil && len(vulns) > 0 {
+		context += fmt.Sprintf("\n\n漏洞数量: %d", len(vulns))
+		critical := 0
+		high := 0
+		for _, vuln := range vulns {
+			if vuln.Severity == "critical" {
+				critical++
+			} else if vuln.Severity == "high" {
+				high++
+			}
+		}
+		context += fmt.Sprintf(" (严重: %d, 高危: %d)", critical, high)
+	}
+
+	return context
+}
+
+func (s *AIService) callOllama(config *models.AIConfig, messages []OllamaMessage) (string, string, int, error) {
+	request := OllamaChatRequest{
+		Model:    config.LocalModel,
+		Messages: messages,
+		Stream:   false,
+		Options: map[string]interface{}{
+			"temperature": config.LocalTemperature,
+			"num_predict": config.LocalMaxTokens,
+		},
+	}
+
+	body, err := json.Marshal(request)
+	if err != nil {
+		return "", "", 0, err
+	}
+
+	resp, err := http.Post(
+		config.LocalBaseURL+"/api/chat",
+		"application/json",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return "", "", 0, fmt.Errorf("无法连接到Ollama: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", "", 0, fmt.Errorf("Ollama返回错误状态: %d", resp.StatusCode)
+	}
+
+	var response OllamaChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return "", "", 0, err
+	}
+
+	return response.Message.Content, config.LocalModel, 0, nil
+}
+
+func (s *AIService) callOpenAI(config *models.AIConfig, messages []OllamaMessage) (string, string, int, error) {
+	openaiMessages := make([]OpenAIChatMessage, len(messages))
+	for i, msg := range messages {
+		openaiMessages[i] = OpenAIChatMessage{
+			Role:    msg.Role,
+			Content: msg.Content,
+		}
+	}
+
+	request := OpenAIChatRequest{
+		Model:       config.CloudModel,
+		Messages:    openaiMessages,
+		Temperature: config.CloudTemperature,
+		MaxTokens:   config.CloudMaxTokens,
+	}
+
+	body, err := json.Marshal(request)
+	if err != nil {
+		return "", "", 0, err
+	}
+
+	baseURL := config.CloudBaseURL
+	if baseURL == "" {
+		if config.CloudProvider == "deepseek" {
+			baseURL = "https://api.deepseek.com/v1"
+		} else {
+			baseURL = "https://api.openai.com/v1"
+		}
+	}
+
+	req, err := http.NewRequest("POST", baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return "", "", 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+config.CloudAPIKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", "", 0, fmt.Errorf("API返回错误: %d - %s", resp.StatusCode, string(bodyBytes))
+	}
+
+	var response OpenAIChatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+		return "", "", 0, err
+	}
+
+	if len(response.Choices) == 0 {
+		return "", "", 0, fmt.Errorf("没有返回内容")
+	}
+
+	return response.Choices[0].Message.Content, config.CloudModel, response.Usage.TotalTokens, nil
+}
+
+// ==================== 主动建议 ====================
+
+func (s *AIService) CreateHighVulnSuggestion(vulnID string, title string, description string) error {
+	refData, _ := json.Marshal(map[string]string{"vuln_id": vulnID})
+	suggestion := &models.ActiveSuggestion{
+		Type:        "high_vuln",
+		Title:       title,
+		Description: description,
+		Reference:   string(refData),
+	}
+	return s.aiRepo.CreateSuggestion(suggestion)
+}
+
+func (s *AIService) GetUnreadSuggestions() ([]models.ActiveSuggestion, error) {
+	return s.aiRepo.GetUnreadSuggestions()
+}
+
+func (s *AIService) MarkSuggestionRead(id uuid.UUID) error {
+	return s.aiRepo.MarkSuggestionRead(id)
+}
+
+func (s *AIService) DismissSuggestion(id uuid.UUID) error {
+	return s.aiRepo.DismissSuggestion(id)
+}
+
+// ==================== 工具调用 ====================
+
+func (s *AIService) GetAvailableTools() []FunctionDefinition {
+	return []FunctionDefinition{
+		{
+			Name:        "list_assets",
+			Description: "列出所有资产",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"type": map[string]interface{}{
+						"type":        "string",
+						"description": "资产类型过滤 (可选)",
+					},
+				},
+			},
+		},
+		{
+			Name:        "list_vulnerabilities",
+			Description: "列出所有漏洞",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"severity": map[string]interface{}{
+						"type":        "string",
+						"description": "严重级别过滤 (可选)",
+					},
+				},
+			},
+		},
+		{
+			Name:        "get_vulnerability",
+			Description: "获取单个漏洞详情",
+			Parameters: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"id": map[string]interface{}{
+						"type":        "string",
+						"description": "漏洞ID",
+					},
+				},
+				"required": []string{"id"},
+			},
+		},
+	}
+}
+
+// ==================== 日志 ====================
+
+func (s *AIService) GetLogs(sessionID uuid.UUID, limit int) ([]models.AILog, error) {
+	return s.aiRepo.GetLogs(sessionID, limit)
+}

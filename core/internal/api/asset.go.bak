@@ -1,0 +1,386 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"github.com/kunlun-sec/lunying/internal/repository"
+	"github.com/kunlun-sec/lunying/internal/service"
+)
+
+type AssetAPI struct {
+	assetService *service.AssetService
+	assetRepo    *repository.AssetRepository
+}
+
+func NewAssetAPI(assetService *service.AssetService, assetRepo *repository.AssetRepository) *AssetAPI {
+	return &AssetAPI{
+		assetService: assetService,
+		assetRepo:    assetRepo,
+	}
+}
+
+func (api *AssetAPI) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/assets", api.ListAssets)
+	mux.HandleFunc("/api/assets/tree", api.GetAssetTree)
+	mux.HandleFunc("/api/assets/stats", api.GetAssetStats)
+	mux.HandleFunc("/api/assets/topology", api.GetTopologyData)
+	mux.HandleFunc("/api/assets/export", api.ExportAssets)
+	mux.HandleFunc("/api/assets/search", api.SearchAssets)
+	
+	mux.HandleFunc("/api/assets/", api.handleAssetDetail)
+}
+
+func (api *AssetAPI) handleAssetDetail(w http.ResponseWriter, r *http.Request) {
+	pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/assets/"), "/")
+	if len(pathParts) < 1 || pathParts[0] == "" {
+		api.respondError(w, http.StatusBadRequest, "无效的请求")
+		return
+	}
+	
+	assetID, err := uuid.Parse(pathParts[0])
+	if err != nil {
+		api.respondError(w, http.StatusBadRequest, "无效的资产ID")
+		return
+	}
+	
+	if len(pathParts) >= 2 && pathParts[1] != "" {
+		switch pathParts[1] {
+		case "tags":
+			if r.Method == http.MethodPost {
+				api.AddTags(w, r, assetID)
+			} else if r.Method == http.MethodDelete {
+				api.RemoveTags(w, r, assetID)
+			}
+			return
+		}
+	}
+	
+	switch r.Method {
+	case http.MethodGet:
+		api.GetAsset(w, r, assetID)
+	case http.MethodPut:
+		api.UpdateAsset(w, r, assetID)
+	case http.MethodDelete:
+		api.DeleteAsset(w, r, assetID)
+	default:
+		api.respondError(w, http.StatusMethodNotAllowed, "不支持的方法")
+	}
+}
+
+func (api *AssetAPI) respondJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func (api *AssetAPI) respondError(w http.ResponseWriter, status int, message string) {
+	api.respondJSON(w, status, map[string]string{"error": message})
+}
+
+// ListAssets 获取资产列表
+func (api *AssetAPI) ListAssets(w http.ResponseWriter, r *http.Request) {
+	targetIDStr := r.URL.Query().Get("target_id")
+	if targetIDStr == "" {
+		api.respondError(w, http.StatusBadRequest, "目标ID不能为空")
+		return
+	}
+	
+	targetID, err := uuid.Parse(targetIDStr)
+	if err != nil {
+		api.respondError(w, http.StatusBadRequest, "无效的目标ID")
+		return
+	}
+	
+	assetType := r.URL.Query().Get("type")
+	minImportance := 0
+	if imp := r.URL.Query().Get("min_importance"); imp != "" {
+		_, _ = json.Unmarshal([]byte(imp), &minImportance)
+	}
+	
+	var assets []*models.Asset
+	if assetType != "" || minImportance > 0 {
+		assets, err = api.assetRepo.Filter(targetID, assetType, minImportance)
+	} else {
+		assets, err = api.assetRepo.GetByTargetID(targetID)
+	}
+	
+	if err != nil {
+		api.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	
+	api.respondJSON(w, http.StatusOK, assets)
+}
+
+// GetAsset 获取单个资产
+func (api *AssetAPI) GetAsset(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	asset, err := api.assetRepo.GetByID(id)
+	if err != nil {
+		api.respondError(w, http.StatusNotFound, "资产不存在")
+		return
+	}
+	
+	api.respondJSON(w, http.StatusOK, asset)
+}
+
+// CreateAsset 创建资产
+func (api *AssetAPI) CreateAsset(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TargetID    uuid.UUID `json:"target_id"`
+		Type        string    `json:"type"`
+		Name        string    `json:"name"`
+		Value       string    `json:"value"`
+		ParentID    *uuid.UUID `json:"parent_id"`
+		Description string    `json:"description"`
+		Extra       string    `json:"extra"`
+		Tags        string    `json:"tags"`
+	}
+	
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		api.respondError(w, http.StatusBadRequest, "无效的请求")
+		return
+	}
+	
+	asset := &models.Asset{
+		TargetID:    req.TargetID,
+		Type:        req.Type,
+		Name:        req.Name,
+		Value:       req.Value,
+		ParentID:    req.ParentID,
+		Description: req.Description,
+		Extra:       req.Extra,
+		Tags:        req.Tags,
+		Status:      "active",
+	}
+	
+	if err := api.assetService.CreateAsset(asset); err != nil {
+		api.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	
+	api.respondJSON(w, http.StatusCreated, asset)
+}
+
+// UpdateAsset 更新资产
+func (api *AssetAPI) UpdateAsset(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	asset, err := api.assetRepo.GetByID(id)
+	if err != nil {
+		api.respondError(w, http.StatusNotFound, "资产不存在")
+		return
+	}
+	
+	var req struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+		Status      string `json:"status"`
+		Extra       string `json:"extra"`
+		Tags        string `json:"tags"`
+	}
+	
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		api.respondError(w, http.StatusBadRequest, "无效的请求")
+		return
+	}
+	
+	if req.Name != "" {
+		asset.Name = req.Name
+	}
+	if req.Description != "" {
+		asset.Description = req.Description
+	}
+	if req.Status != "" {
+		asset.Status = req.Status
+	}
+	if req.Extra != "" {
+		asset.Extra = req.Extra
+	}
+	if req.Tags != "" {
+		asset.Tags = req.Tags
+	}
+	
+	asset.Importance = api.assetService.CalculateImportance(asset)
+	
+	if err := api.assetRepo.Update(asset); err != nil {
+		api.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	
+	api.respondJSON(w, http.StatusOK, asset)
+}
+
+// DeleteAsset 删除资产
+func (api *AssetAPI) DeleteAsset(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	if err := api.assetRepo.Delete(id); err != nil {
+		api.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	
+	api.respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// GetAssetTree 获取资产树
+func (api *AssetAPI) GetAssetTree(w http.ResponseWriter, r *http.Request) {
+	targetIDStr := r.URL.Query().Get("target_id")
+	if targetIDStr == "" {
+		api.respondError(w, http.StatusBadRequest, "目标ID不能为空")
+		return
+	}
+	
+	targetID, err := uuid.Parse(targetIDStr)
+	if err != nil {
+		api.respondError(w, http.StatusBadRequest, "无效的目标ID")
+		return
+	}
+	
+	assets, err := api.assetService.GetAssetTree(targetID)
+	if err != nil {
+		api.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	
+	api.respondJSON(w, http.StatusOK, assets)
+}
+
+// GetAssetStats 获取资产统计
+func (api *AssetAPI) GetAssetStats(w http.ResponseWriter, r *http.Request) {
+	targetIDStr := r.URL.Query().Get("target_id")
+	if targetIDStr == "" {
+		api.respondError(w, http.StatusBadRequest, "目标ID不能为空")
+		return
+	}
+	
+	targetID, err := uuid.Parse(targetIDStr)
+	if err != nil {
+		api.respondError(w, http.StatusBadRequest, "无效的目标ID")
+		return
+	}
+	
+	stats, err := api.assetService.GetAssetStats(targetID)
+	if err != nil {
+		api.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	
+	api.respondJSON(w, http.StatusOK, stats)
+}
+
+// SearchAssets 搜索资产
+func (api *AssetAPI) SearchAssets(w http.ResponseWriter, r *http.Request) {
+	targetIDStr := r.URL.Query().Get("target_id")
+	keyword := r.URL.Query().Get("keyword")
+	
+	if targetIDStr == "" {
+		api.respondError(w, http.StatusBadRequest, "目标ID不能为空")
+		return
+	}
+	
+	if keyword == "" {
+		api.respondError(w, http.StatusBadRequest, "搜索关键词不能为空")
+		return
+	}
+	
+	targetID, err := uuid.Parse(targetIDStr)
+	if err != nil {
+		api.respondError(w, http.StatusBadRequest, "无效的目标ID")
+		return
+	}
+	
+	assets, err := api.assetRepo.Search(targetID, keyword)
+	if err != nil {
+		api.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	
+	api.respondJSON(w, http.StatusOK, assets)
+}
+
+// AddTags 添加标签
+func (api *AssetAPI) AddTags(w http.ResponseWriter, r *http.Request, assetID uuid.UUID) {
+	var req struct {
+		Tags []string `json:"tags"`
+	}
+	
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		api.respondError(w, http.StatusBadRequest, "无效的请求")
+		return
+	}
+	
+	if err := api.assetService.AddTags(assetID, req.Tags); err != nil {
+		api.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	
+	api.respondJSON(w, http.StatusOK, map[string]string{"status": "tags_added"})
+}
+
+// RemoveTags 移除标签
+func (api *AssetAPI) RemoveTags(w http.ResponseWriter, r *http.Request, assetID uuid.UUID) {
+	var req struct {
+		Tags []string `json:"tags"`
+	}
+	
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		api.respondError(w, http.StatusBadRequest, "无效的请求")
+		return
+	}
+	
+	if err := api.assetService.RemoveTags(assetID, req.Tags); err != nil {
+		api.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	
+	api.respondJSON(w, http.StatusOK, map[string]string{"status": "tags_removed"})
+}
+
+// GetTopologyData 获取拓扑图数据
+func (api *AssetAPI) GetTopologyData(w http.ResponseWriter, r *http.Request) {
+	targetIDStr := r.URL.Query().Get("target_id")
+	if targetIDStr == "" {
+		api.respondError(w, http.StatusBadRequest, "目标ID不能为空")
+		return
+	}
+	
+	targetID, err := uuid.Parse(targetIDStr)
+	if err != nil {
+		api.respondError(w, http.StatusBadRequest, "无效的目标ID")
+		return
+	}
+	
+	data, err := api.assetService.GetTopologyData(targetID)
+	if err != nil {
+		api.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	
+	api.respondJSON(w, http.StatusOK, data)
+}
+
+// ExportAssets 导出资产
+func (api *AssetAPI) ExportAssets(w http.ResponseWriter, r *http.Request) {
+	targetIDStr := r.URL.Query().Get("target_id")
+	if targetIDStr == "" {
+		api.respondError(w, http.StatusBadRequest, "目标ID不能为空")
+		return
+	}
+	
+	targetID, err := uuid.Parse(targetIDStr)
+	if err != nil {
+		api.respondError(w, http.StatusBadRequest, "无效的目标ID")
+		return
+	}
+	
+	data, err := api.assetService.ExportToJSON(targetID)
+	if err != nil {
+		api.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", "attachment; filename=assets.json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(data))
+}

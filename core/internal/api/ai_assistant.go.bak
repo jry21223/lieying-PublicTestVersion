@@ -1,0 +1,314 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"github.com/kunlun-sec/lunying/internal/service"
+)
+
+type AIAssistantHandler struct {
+	aiService *service.AIService
+}
+
+func NewAIAssistantHandler(aiService *service.AIService) *AIAssistantHandler {
+	return &AIAssistantHandler{
+		aiService: aiService,
+	}
+}
+
+func (h *AIAssistantHandler) respondJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func (h *AIAssistantHandler) respondError(w http.ResponseWriter, status int, message string) {
+	h.respondJSON(w, status, map[string]string{"error": message})
+}
+
+func (h *AIAssistantHandler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/ai/config", h.HandleConfig)
+	mux.HandleFunc("/api/ai/sessions", h.HandleSessions)
+	mux.HandleFunc("/api/ai/sessions/", h.HandleSession)
+	mux.HandleFunc("/api/ai/suggestions", h.HandleSuggestions)
+	mux.HandleFunc("/api/ai/suggestions/", h.HandleSuggestion)
+	mux.HandleFunc("/api/ai/tools", h.HandleTools)
+}
+
+// ==================== 配置 ====================
+
+func (h *AIAssistantHandler) HandleConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		h.GetConfig(w, r)
+	case "PUT":
+		h.UpdateConfig(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (h *AIAssistantHandler) GetConfig(w http.ResponseWriter, r *http.Request) {
+	config, err := h.aiService.GetConfig()
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.respondJSON(w, http.StatusOK, config)
+}
+
+type UpdateConfigRequest struct {
+	Mode                  string  `json:"mode"`
+	Active                bool    `json:"active"`
+	LocalBaseURL          string  `json:"local_base_url"`
+	LocalModel            string  `json:"local_model"`
+	LocalTemperature      float64 `json:"local_temperature"`
+	LocalMaxTokens        int     `json:"local_max_tokens"`
+	CloudProvider         string  `json:"cloud_provider"`
+	CloudAPIKey           string  `json:"cloud_api_key"`
+	CloudBaseURL          string  `json:"cloud_base_url"`
+	CloudModel            string  `json:"cloud_model"`
+	CloudTemperature      float64 `json:"cloud_temperature"`
+	CloudMaxTokens        int     `json:"cloud_max_tokens"`
+	SystemPrompt          string  `json:"system_prompt"`
+	EnableFunctionCalling bool    `json:"enable_function_calling"`
+	EnableActiveSuggestions bool  `json:"enable_active_suggestions"`
+	EnableContextAwareness bool  `json:"enable_context_awareness"`
+}
+
+func (h *AIAssistantHandler) UpdateConfig(w http.ResponseWriter, r *http.Request) {
+	var req UpdateConfigRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondError(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	config, err := h.aiService.GetConfig()
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	config.Mode = models.AIMode(req.Mode)
+	config.Active = req.Active
+	config.LocalBaseURL = req.LocalBaseURL
+	config.LocalModel = req.LocalModel
+	config.LocalTemperature = req.LocalTemperature
+	config.LocalMaxTokens = req.LocalMaxTokens
+	config.CloudProvider = req.CloudProvider
+	config.CloudAPIKey = req.CloudAPIKey
+	config.CloudBaseURL = req.CloudBaseURL
+	config.CloudModel = req.CloudModel
+	config.CloudTemperature = req.CloudTemperature
+	config.CloudMaxTokens = req.CloudMaxTokens
+	config.SystemPrompt = req.SystemPrompt
+	config.EnableFunctionCalling = req.EnableFunctionCalling
+	config.EnableActiveSuggestions = req.EnableActiveSuggestions
+	config.EnableContextAwareness = req.EnableContextAwareness
+
+	if err := h.aiService.UpdateConfig(config); err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, config)
+}
+
+// ==================== 会话 ====================
+
+func (h *AIAssistantHandler) HandleSessions(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		h.ListSessions(w, r)
+	case "POST":
+		h.CreateSession(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+type CreateSessionRequest struct {
+	Title string `json:"title"`
+}
+
+func (h *AIAssistantHandler) CreateSession(w http.ResponseWriter, r *http.Request) {
+	var req CreateSessionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondError(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	session, err := h.aiService.CreateSession(req.Title)
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondJSON(w, http.StatusCreated, session)
+}
+
+func (h *AIAssistantHandler) ListSessions(w http.ResponseWriter, r *http.Request) {
+	sessions, err := h.aiService.ListSessions()
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.respondJSON(w, http.StatusOK, sessions)
+}
+
+func (h *AIAssistantHandler) HandleSession(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/ai/sessions/")
+	parts := strings.Split(path, "/")
+
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	id, err := uuid.Parse(parts[0])
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "Invalid session ID")
+		return
+	}
+
+	if len(parts) == 1 {
+		switch r.Method {
+		case "GET":
+			h.GetSession(w, r, id)
+		case "DELETE":
+			h.DeleteSession(w, r, id)
+		default:
+			http.NotFound(w, r)
+		}
+		return
+	}
+
+	if len(parts) >= 2 && parts[1] == "messages" {
+		switch r.Method {
+		case "POST":
+			h.SendMessage(w, r, id)
+		default:
+			http.NotFound(w, r)
+		}
+		return
+	}
+
+	http.NotFound(w, r)
+}
+
+func (h *AIAssistantHandler) GetSession(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	session, err := h.aiService.GetSession(id)
+	if err != nil {
+		h.respondError(w, http.StatusNotFound, "Session not found")
+		return
+	}
+	h.respondJSON(w, http.StatusOK, session)
+}
+
+func (h *AIAssistantHandler) DeleteSession(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	if err := h.aiService.DeleteSession(id); err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.respondJSON(w, http.StatusOK, map[string]string{"status": "success"})
+}
+
+type SendMessageRequest struct {
+	Content string `json:"content"`
+}
+
+func (h *AIAssistantHandler) SendMessage(w http.ResponseWriter, r *http.Request, sessionID uuid.UUID) {
+	var req SendMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		h.respondError(w, http.StatusBadRequest, "Invalid request")
+		return
+	}
+
+	message, err := h.aiService.SendMessage(sessionID, req.Content)
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, message)
+}
+
+// ==================== 主动建议 ====================
+
+func (h *AIAssistantHandler) HandleSuggestions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.NotFound(w, r)
+		return
+	}
+	h.GetUnreadSuggestions(w, r)
+}
+
+func (h *AIAssistantHandler) GetUnreadSuggestions(w http.ResponseWriter, r *http.Request) {
+	suggestions, err := h.aiService.GetUnreadSuggestions()
+	if err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.respondJSON(w, http.StatusOK, suggestions)
+}
+
+func (h *AIAssistantHandler) HandleSuggestion(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/ai/suggestions/")
+	parts := strings.Split(path, "/")
+
+	if len(parts) < 2 {
+		http.NotFound(w, r)
+		return
+	}
+
+	id, err := uuid.Parse(parts[0])
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "Invalid suggestion ID")
+		return
+	}
+
+	action := parts[1]
+	switch action {
+	case "read":
+		if r.Method == "POST" {
+			h.MarkSuggestionRead(w, r, id)
+		}
+	case "dismiss":
+		if r.Method == "POST" {
+			h.DismissSuggestion(w, r, id)
+		}
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (h *AIAssistantHandler) MarkSuggestionRead(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	if err := h.aiService.MarkSuggestionRead(id); err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.respondJSON(w, http.StatusOK, map[string]string{"status": "success"})
+}
+
+func (h *AIAssistantHandler) DismissSuggestion(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	if err := h.aiService.DismissSuggestion(id); err != nil {
+		h.respondError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	h.respondJSON(w, http.StatusOK, map[string]string{"status": "success"})
+}
+
+// ==================== 工具 ====================
+
+func (h *AIAssistantHandler) HandleTools(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.NotFound(w, r)
+		return
+	}
+	tools := h.aiService.GetAvailableTools()
+	h.respondJSON(w, http.StatusOK, tools)
+}

@@ -1,0 +1,351 @@
+package service
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"github.com/kunlun-sec/lunying/internal/repository"
+)
+
+// ReportGeneratorService 报告生成服务
+type ReportGeneratorService struct {
+	reportRepo  *repository.ReportGeneratorRepository
+	vulnRepo    *repository.VulnerabilityRepository
+	exportDir   string
+}
+
+func NewReportGeneratorService(
+	reportRepo *repository.ReportGeneratorRepository,
+	vulnRepo *repository.VulnerabilityRepository,
+) *ReportGeneratorService {
+	exportDir := "./exports"
+	os.MkdirAll(exportDir, 0755)
+
+	return &ReportGeneratorService{
+		reportRepo: reportRepo,
+		vulnRepo:   vulnRepo,
+		exportDir:  exportDir,
+	}
+}
+
+// ==================== 报告生成 ====================
+
+// GenerateReportRequest 生成报告请求
+type GenerateReportRequest struct {
+	DraftID    uuid.UUID   `json:"draft_id"`
+	TemplateID uuid.UUID   `json:"template_id"`
+	Format     string      `json:"format"` // markdown, pdf, html
+	SelectedVulns []string `json:"selected_vulns"`
+}
+
+// GenerateReport 生成报告
+func (s *ReportGeneratorService) GenerateReport(req *GenerateReportRequest) (string, error) {
+	draft, err := s.reportRepo.GetDraft(req.DraftID)
+	if err != nil {
+		return "", fmt.Errorf("获取报告草稿失败: %w", err)
+	}
+
+	template, err := s.reportRepo.GetTemplate(req.TemplateID)
+	if err != nil {
+		return "", fmt.Errorf("获取模板失败: %w", err)
+	}
+
+	vulnerabilities, err := s.getSelectedVulnerabilities(draft.ID, req.SelectedVulns)
+	if err != nil {
+		return "", fmt.Errorf("获取漏洞列表失败: %w", err)
+	}
+
+	content := s.renderTemplate(template.Content, draft, vulnerabilities)
+
+	var filePath string
+	switch req.Format {
+	case "markdown":
+		filePath, err = s.exportMarkdown(draft, content)
+	case "html":
+		filePath, err = s.exportHTML(draft, content, template.Styles)
+	case "pdf":
+		filePath, err = s.exportPDF(draft, content, template.Styles)
+	default:
+		return "", fmt.Errorf("不支持的格式: %s", req.Format)
+	}
+
+	if err != nil {
+		return "", err
+	}
+
+	s.saveExportRecord(draft.ID, req.Format, filePath)
+	return filePath, nil
+}
+
+// renderTemplate 渲染报告模板
+func (s *ReportGeneratorService) renderTemplate(templateContent string, draft *models.ReportDraft, vulnerabilities []models.Vulnerability) string {
+	content := templateContent
+
+	replacements := map[string]string{
+		"{{目标名称}}":      draft.TargetName,
+		"{{目标URL}}":       draft.TargetURL,
+		"{{测试范围}}":      draft.TargetScope,
+		"{{作者}}":         draft.Author,
+		"{{客户名称}}":      draft.Company,
+		"{{执行摘要}}":      draft.ExecutiveSummary,
+		"{{测试方法}}":      draft.Methodology,
+		"{{结论}}":         draft.Conclusion,
+		"{{生成时间}}":      time.Now().Format("2006-01-02 15:04:05"),
+		"{{测试时间}}":      time.Now().Format("2006-01-02"),
+		"{{生成日期}}":      time.Now().Format("2006-01-02"),
+		"{{版本}}":         fmt.Sprintf("v%d", draft.Version),
+		"{{严重数}}":        fmt.Sprintf("%d", countVulnsBySeverity(vulnerabilities, "critical")),
+		"{{高危数}}":        fmt.Sprintf("%d", countVulnsBySeverity(vulnerabilities, "high")),
+		"{{中危数}}":        fmt.Sprintf("%d", countVulnsBySeverity(vulnerabilities, "medium")),
+		"{{低危数}}":        fmt.Sprintf("%d", countVulnsBySeverity(vulnerabilities, "low")),
+		"{{漏洞列表}}":      s.generateVulnList(vulnerabilities),
+		"{{漏洞详细列表}}":    s.generateDetailedVulnList(vulnerabilities),
+		"{{修复建议}}":      s.generateRepairSuggestions(vulnerabilities),
+		"{{加固建议}}":      s.generateRepairSuggestions(vulnerabilities),
+	}
+
+	for placeholder, value := range replacements {
+		content = strings.ReplaceAll(content, placeholder, value)
+	}
+
+	return content
+}
+
+func countVulnsBySeverity(vulns []models.Vulnerability, severity string) int {
+	count := 0
+	for _, v := range vulns {
+		if v.Severity == severity {
+			count++
+		}
+	}
+	return count
+}
+
+func (s *ReportGeneratorService) generateVulnList(vulns []models.Vulnerability) string {
+	if len(vulns) == 0 {
+		return "暂无发现的漏洞"
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString("\n")
+	for i, v := range vulns {
+		buf.WriteString(fmt.Sprintf("### %d. %s\n\n", i+1, v.Title))
+		buf.WriteString(fmt.Sprintf("- **严重程度**: %s\n", v.Severity))
+		buf.WriteString(fmt.Sprintf("- **漏洞类型**: %s\n", v.VulnType))
+		buf.WriteString(fmt.Sprintf("- **目标**: %s\n\n", v.Target))
+		if v.Description != "" {
+			buf.WriteString(fmt.Sprintf("**描述**: %s\n\n", v.Description))
+		}
+	}
+	return buf.String()
+}
+
+func (s *ReportGeneratorService) generateDetailedVulnList(vulns []models.Vulnerability) string {
+	if len(vulns) == 0 {
+		return "暂无发现的漏洞"
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString("\n")
+	for i, v := range vulns {
+		buf.WriteString(fmt.Sprintf("## 漏洞 %d: %s\n\n", i+1, v.Title))
+		buf.WriteString(fmt.Sprintf("| 项目 | 内容 |\n"))
+		buf.WriteString(fmt.Sprintf("|-----|------|\n"))
+		buf.WriteString(fmt.Sprintf("| 严重程度 | %s |\n", v.Severity))
+		buf.WriteString(fmt.Sprintf("| 漏洞类型 | %s |\n", v.VulnType))
+		buf.WriteString(fmt.Sprintf("| 目标 | %s |\n\n", v.Target))
+
+		if v.Description != "" {
+			buf.WriteString("### 漏洞描述\n\n")
+			buf.WriteString(fmt.Sprintf("%s\n\n", v.Description))
+		}
+
+		if v.Proof != "" {
+			buf.WriteString("### 复现过程\n\n")
+			buf.WriteString(fmt.Sprintf("```\n%s\n```\n\n", v.Proof))
+		}
+
+		if v.RepairSuggestion != "" {
+			buf.WriteString("### 修复建议\n\n")
+			buf.WriteString(fmt.Sprintf("%s\n\n", v.RepairSuggestion))
+		}
+	}
+	return buf.String()
+}
+
+func (s *ReportGeneratorService) generateRepairSuggestions(vulns []models.Vulnerability) string {
+	if len(vulns) == 0 {
+		return "暂无修复建议"
+	}
+
+	var buf bytes.Buffer
+	buf.WriteString("\n### 通用修复建议\n\n")
+	buf.WriteString("1. 及时修补发现的安全漏洞\n")
+	buf.WriteString("2. 加强输入验证和输出编码\n")
+	buf.WriteString("3. 实施最小权限原则\n")
+	buf.WriteString("4. 定期进行安全评估\n\n")
+
+	for _, v := range vulns {
+		if v.RepairSuggestion != "" {
+			buf.WriteString(fmt.Sprintf("### %s 修复建议\n\n", v.Title))
+			buf.WriteString(fmt.Sprintf("%s\n\n", v.RepairSuggestion))
+		}
+	}
+
+	return buf.String()
+}
+
+func (s *ReportGeneratorService) getSelectedVulnerabilities(reportID uuid.UUID, selectedIDs []string) ([]models.Vulnerability, error) {
+	if len(selectedIDs) == 0 {
+		orders, err := s.reportRepo.ListVulnOrders(reportID)
+		if err != nil {
+			return nil, err
+		}
+		for _, order := range orders {
+			if order.Included {
+				selectedIDs = append(selectedIDs, order.VulnID.String())
+			}
+		}
+	}
+
+	var vulns []models.Vulnerability
+	for _, idStr := range selectedIDs {
+		if id, err := uuid.Parse(idStr); err == nil {
+			if vuln, err := s.vulnRepo.GetVulnerability(id); err == nil {
+				vulns = append(vulns, *vuln)
+			}
+		}
+	}
+
+	return vulns, nil
+}
+
+// ==================== 导出功能 ====================
+
+func (s *ReportGeneratorService) exportMarkdown(draft *models.ReportDraft, content string) (string, error) {
+	filename := fmt.Sprintf("%s-%s.md", sanitizeFilename(draft.Title), time.Now().Format("20060102-150405"))
+	filePath := filepath.Join(s.exportDir, filename)
+
+	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		return "", fmt.Errorf("写入Markdown文件失败: %w", err)
+	}
+
+	return filePath, nil
+}
+
+func (s *ReportGeneratorService) exportHTML(draft *models.ReportDraft, content string, styles string) (string, error) {
+	htmlTemplate := `
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>{{.Title}}</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 900px; margin: 0 auto; padding: 40px 20px; line-height: 1.6; }
+        h1, h2, h3 { color: #1a202c; margin-top: 1.5em; }
+        h1 { border-bottom: 2px solid #e2e8f0; padding-bottom: 0.5em; }
+        code { background: #f7fafc; padding: 0.2em 0.4em; border-radius: 3px; font-family: SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+        pre { background: #1a202c; color: #e2e8f0; padding: 1em; border-radius: 6px; overflow-x: auto; }
+        pre code { background: none; padding: 0; }
+        table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+        th, td { border: 1px solid #e2e8f0; padding: 0.75em; text-align: left; }
+        th { background: #f7fafc; font-weight: 600; }
+        {{.Styles}}
+    </style>
+</head>
+<body>
+    <pre>{{.Content}}</pre>
+</body>
+</html>`
+
+	tmpl, err := template.New("html").Parse(htmlTemplate)
+	if err != nil {
+		return "", fmt.Errorf("解析HTML模板失败: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, map[string]interface{}{
+		"Title":   draft.Title,
+		"Content": content,
+		"Styles":  styles,
+	}); err != nil {
+		return "", fmt.Errorf("渲染HTML失败: %w", err)
+	}
+
+	filename := fmt.Sprintf("%s-%s.html", sanitizeFilename(draft.Title), time.Now().Format("20060102-150405"))
+	filePath := filepath.Join(s.exportDir, filename)
+
+	if err := os.WriteFile(filePath, buf.Bytes(), 0644); err != nil {
+		return "", fmt.Errorf("写入HTML文件失败: %w", err)
+	}
+
+	return filePath, nil
+}
+
+func (s *ReportGeneratorService) exportPDF(draft *models.ReportDraft, content string, styles string) (string, error) {
+	htmlPath, err := s.exportHTML(draft, content, styles)
+	if err != nil {
+		return "", err
+	}
+
+	filename := fmt.Sprintf("%s-%s.pdf", sanitizeFilename(draft.Title), time.Now().Format("20060102-150405"))
+	pdfPath := filepath.Join(s.exportDir, filename)
+
+	return htmlPath, nil
+}
+
+func (s *ReportGeneratorService) saveExportRecord(reportID uuid.UUID, format string, filePath string) error {
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		return err
+	}
+
+	export := &models.ReportExport{
+		ReportID:  reportID,
+		Format:    format,
+		FilePath:  filePath,
+		FileSize:  fileInfo.Size(),
+		CreatedAt: time.Now(),
+	}
+
+	return s.reportRepo.CreateExport(export)
+}
+
+// ==================== 版本管理 ====================
+
+func (s *ReportGeneratorService) SaveVersion(draft *models.ReportDraft, changeLog string) error {
+	version := &models.ReportVersion{
+		ReportID:  draft.ID,
+		Version:   draft.Version,
+		Title:     draft.Title,
+		Content:   draft.Content,
+		ChangeLog: changeLog,
+		CreatedAt: time.Now(),
+	}
+
+	return s.reportRepo.CreateVersion(version)
+}
+
+// ==================== 初始化 ====================
+
+func (s *ReportGeneratorService) Initialize() error {
+	return s.reportRepo.InitializeDefaultTemplates()
+}
+
+func sanitizeFilename(name string) string {
+	re := regexp.MustCompile(`[<>:"/\\|?*\s]+`)
+	sanitized := re.ReplaceAllString(name, "_")
+	if len(sanitized) > 50 {
+		sanitized = sanitized[:50]
+	}
+	return sanitized
+}

@@ -1,0 +1,424 @@
+package repository
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"gorm.io/gorm"
+)
+
+type ToolRepository struct {
+	db *gorm.DB
+}
+
+func NewToolRepository(db *gorm.DB) *ToolRepository {
+	return &ToolRepository{db: db}
+}
+
+func (r *ToolRepository) InitializeDefaultTools() error {
+	defaultTools := []*models.Tool{
+		{
+			Name:         "amass",
+			DisplayName:  "Amass",
+			Description:  "主动+被动子域枚举工具",
+			Category:     "subdomain",
+			Command:      "amass",
+			InputType:    "domain",
+			OutputType:   "domains",
+			Timeout:      600,
+			IsBuiltin:    true,
+		},
+		{
+			Name:         "subfinder",
+			DisplayName:  "Subfinder",
+			Description:  "被动子域枚举工具",
+			Category:     "subdomain",
+			Command:      "subfinder",
+			InputType:    "domain",
+			OutputType:   "domains",
+			Timeout:      300,
+			IsBuiltin:    true,
+		},
+		{
+			Name:         "masscan",
+			DisplayName:  "Masscan",
+			Description:  "快速端口扫描器",
+			Category:     "portscan",
+			Command:      "masscan",
+			InputType:    "ip",
+			OutputType:   "ports",
+			Timeout:      300,
+			IsBuiltin:    true,
+		},
+		{
+			Name:         "nmap",
+			DisplayName:  "Nmap",
+			Description:  "深度端口扫描和服务识别",
+			Category:     "portscan",
+			Command:      "nmap",
+			InputType:    "ip",
+			OutputType:   "services",
+			Timeout:      600,
+			IsBuiltin:    true,
+		},
+		{
+			Name:         "wappalyzer",
+			DisplayName:  "Wappalyzer",
+			Description:  "Web指纹识别",
+			Category:     "fingerprint",
+			Command:      "wappalyzer",
+			InputType:    "url",
+			OutputType:   "fingerprints",
+			Timeout:      120,
+			IsBuiltin:    true,
+		},
+		{
+			Name:         "dirsearch",
+			DisplayName:  "Dirsearch",
+			Description:  "Web目录/文件爆破",
+			Category:     "fuzz",
+			Command:      "dirsearch",
+			InputType:    "url",
+			OutputType:   "paths",
+			Timeout:      600,
+			IsBuiltin:    true,
+		},
+		{
+			Name:         "ffuf",
+			DisplayName:  "FFUF",
+			Description:  "高速Web模糊测试工具",
+			Category:     "fuzz",
+			Command:      "ffuf",
+			InputType:    "url",
+			OutputType:   "paths",
+			Timeout:      600,
+			IsBuiltin:    true,
+		},
+		{
+			Name:         "trufflehog",
+			DisplayName:  "TruffleHog",
+			Description:  "代码仓库泄露扫描",
+			Category:     "leak",
+			Command:      "trufflehog",
+			InputType:    "repo",
+			OutputType:   "secrets",
+			Timeout:      600,
+			IsBuiltin:    true,
+		},
+	}
+
+	for _, tool := range defaultTools {
+		existing, _ := r.GetByName(tool.Name)
+		if existing == nil {
+			if err := r.Create(tool); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (r *ToolRepository) Create(tool *models.Tool) error {
+	return r.db.Create(tool).Error
+}
+
+func (r *ToolRepository) GetByID(id uuid.UUID) (*models.Tool, error) {
+	var tool models.Tool
+	err := r.db.First(&tool, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &tool, nil
+}
+
+func (r *ToolRepository) GetByName(name string) (*models.Tool, error) {
+	var tool models.Tool
+	err := r.db.First(&tool, "name = ?", name).Error
+	if err != nil {
+		return nil, err
+	}
+	return &tool, nil
+}
+
+func (r *ToolRepository) List() ([]*models.Tool, error) {
+	var tools []*models.Tool
+	err := r.db.Order("category, name").Find(&tools).Error
+	return tools, err
+}
+
+func (r *ToolRepository) ListByCategory(category string) ([]*models.Tool, error) {
+	var tools []*models.Tool
+	err := r.db.Where("category = ?", category).Order("name").Find(&tools).Error
+	return tools, err
+}
+
+func (r *ToolRepository) Update(tool *models.Tool) error {
+	tool.UpdatedAt = time.Now()
+	return r.db.Save(tool).Error
+}
+
+func (r *ToolRepository) Delete(id uuid.UUID) error {
+	return r.db.Delete(&models.Tool{}, "id = ?", id).Error
+}
+
+func (r *ToolRepository) MarkInstalled(id uuid.UUID, version string, path string) error {
+	return r.db.Model(&models.Tool{}).
+		Where("id = ?", id).
+		Updates(map[string]interface{}{
+			"installed":    true,
+			"version":      version,
+			"install_path": path,
+			"updated_at":   time.Now(),
+		}).Error
+}
+
+func (r *ToolRepository) MarkNotInstalled(id uuid.UUID) error {
+	return r.db.Model(&models.Tool{}).
+		Where("id = ?", id).
+		Updates(map[string]interface{}{
+			"installed":  false,
+			"updated_at": time.Now(),
+		}).Error
+}
+
+type WorkflowRepository struct {
+	db *gorm.DB
+}
+
+func NewWorkflowRepository(db *gorm.DB) *WorkflowRepository {
+	return &WorkflowRepository{db: db}
+}
+
+func (r *WorkflowRepository) Create(workflow *models.Workflow) error {
+	return r.db.Create(workflow).Error
+}
+
+func (r *WorkflowRepository) GetByID(id uuid.UUID) (*models.Workflow, error) {
+	var workflow models.Workflow
+	err := r.db.First(&workflow, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &workflow, nil
+}
+
+func (r *WorkflowRepository) List() ([]*models.Workflow, error) {
+	var workflows []*models.Workflow
+	err := r.db.Order("created_at DESC").Find(&workflows).Error
+	return workflows, err
+}
+
+func (r *WorkflowRepository) ListTemplates() ([]*models.Workflow, error) {
+	var workflows []*models.Workflow
+	err := r.db.Where("is_template = ?", true).Order("name").Find(&workflows).Error
+	return workflows, err
+}
+
+func (r *WorkflowRepository) Update(workflow *models.Workflow) error {
+	workflow.UpdatedAt = time.Now()
+	return r.db.Save(workflow).Error
+}
+
+func (r *WorkflowRepository) Delete(id uuid.UUID) error {
+	return r.db.Delete(&models.Workflow{}, "id = ?", id).Error
+}
+
+type WorkflowExecutionRepository struct {
+	db *gorm.DB
+}
+
+func NewWorkflowExecutionRepository(db *gorm.DB) *WorkflowExecutionRepository {
+	return &WorkflowExecutionRepository{db: db}
+}
+
+func (r *WorkflowExecutionRepository) Create(exec *models.WorkflowExecution) error {
+	return r.db.Create(exec).Error
+}
+
+func (r *WorkflowExecutionRepository) GetByID(id uuid.UUID) (*models.WorkflowExecution, error) {
+	var exec models.WorkflowExecution
+	err := r.db.First(&exec, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &exec, nil
+}
+
+func (r *WorkflowExecutionRepository) ListByTarget(targetID uuid.UUID, limit int) ([]*models.WorkflowExecution, error) {
+	var execs []*models.WorkflowExecution
+	query := r.db.Where("target_id = ?", targetID)
+	if limit > 0 {
+		query = query.Limit(limit)
+	}
+	err := query.Order("created_at DESC").Find(&execs).Error
+	return execs, err
+}
+
+func (r *WorkflowExecutionRepository) Update(exec *models.WorkflowExecution) error {
+	exec.UpdatedAt = time.Now()
+	return r.db.Save(exec).Error
+}
+
+func (r *WorkflowExecutionRepository) UpdateStatus(id uuid.UUID, status string, progress int, message string) error {
+	updates := map[string]interface{}{
+		"status":     status,
+		"progress":   progress,
+		"message":    message,
+		"updated_at": time.Now(),
+	}
+	if status == "running" {
+		now := time.Now()
+		updates["started_at"] = &now
+	} else if status == "completed" || status == "failed" || status == "cancelled" {
+		now := time.Now()
+		updates["completed_at"] = &now
+	}
+	return r.db.Model(&models.WorkflowExecution{}).Where("id = ?", id).Updates(updates).Error
+}
+
+func (r *WorkflowExecutionRepository) AppendLogs(id uuid.UUID, logs string) error {
+	return r.db.Model(&models.WorkflowExecution{}).
+		Where("id = ?", id).
+		UpdateColumn("logs", gorm.Expr("logs || ?", logs)).Error
+}
+
+type ToolExecutionRepository struct {
+	db *gorm.DB
+}
+
+func NewToolExecutionRepository(db *gorm.DB) *ToolExecutionRepository {
+	return &ToolExecutionRepository{db: db}
+}
+
+func (r *ToolExecutionRepository) Create(exec *models.ToolExecution) error {
+	return r.db.Create(exec).Error
+}
+
+func (r *ToolExecutionRepository) GetByID(id uuid.UUID) (*models.ToolExecution, error) {
+	var exec models.ToolExecution
+	err := r.db.First(&exec, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &exec, nil
+}
+
+func (r *ToolExecutionRepository) ListByWorkflowExecution(workflowExecID uuid.UUID) ([]*models.ToolExecution, error) {
+	var execs []*models.ToolExecution
+	err := r.db.Where("workflow_exec_id = ?", workflowExecID).
+		Order("created_at").Find(&execs).Error
+	return execs, err
+}
+
+func (r *ToolExecutionRepository) Update(exec *models.ToolExecution) error {
+	exec.UpdatedAt = time.Now()
+	return r.db.Save(exec).Error
+}
+
+func (r *ToolExecutionRepository) UpdateStatus(id uuid.UUID, status string, output string, parsedOutput string, errMsg string, exitCode int, duration int64) error {
+	updates := map[string]interface{}{
+		"status":        status,
+		"output":        output,
+		"parsed_output": parsedOutput,
+		"error":         errMsg,
+		"exit_code":     exitCode,
+		"duration":      duration,
+		"updated_at":    time.Now(),
+	}
+	if status == "running" {
+		now := time.Now()
+		updates["started_at"] = &now
+	} else if status == "completed" || status == "failed" {
+		now := time.Now()
+		updates["completed_at"] = &now
+	}
+	return r.db.Model(&models.ToolExecution{}).Where("id = ?", id).Updates(updates).Error
+}
+
+type DataSourceRepository struct {
+	db *gorm.DB
+}
+
+func NewDataSourceRepository(db *gorm.DB) *DataSourceRepository {
+	return &DataSourceRepository{db: db}
+}
+
+func (r *DataSourceRepository) Create(ds *models.DataSource) error {
+	return r.db.Create(ds).Error
+}
+
+func (r *DataSourceRepository) GetByID(id uuid.UUID) (*models.DataSource, error) {
+	var ds models.DataSource
+	err := r.db.First(&ds, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &ds, nil
+}
+
+func (r *DataSourceRepository) List() ([]*models.DataSource, error) {
+	var dsList []*models.DataSource
+	err := r.db.Order("priority DESC, name").Find(&dsList).Error
+	return dsList, err
+}
+
+func (r *DataSourceRepository) ListEnabled() ([]*models.DataSource, error) {
+	var dsList []*models.DataSource
+	err := r.db.Where("enabled = ?", true).
+		Order("priority DESC, name").Find(&dsList).Error
+	return dsList, err
+}
+
+func (r *DataSourceRepository) Update(ds *models.DataSource) error {
+	ds.UpdatedAt = time.Now()
+	return r.db.Save(ds).Error
+}
+
+func (r *DataSourceRepository) Delete(id uuid.UUID) error {
+	return r.db.Delete(&models.DataSource{}, "id = ?", id).Error
+}
+
+type WordlistRepository struct {
+	db *gorm.DB
+}
+
+func NewWordlistRepository(db *gorm.DB) *WordlistRepository {
+	return &WordlistRepository{db: db}
+}
+
+func (r *WordlistRepository) Create(wl *models.Wordlist) error {
+	return r.db.Create(wl).Error
+}
+
+func (r *WordlistRepository) GetByID(id uuid.UUID) (*models.Wordlist, error) {
+	var wl models.Wordlist
+	err := r.db.First(&wl, "id = ?", id).Error
+	if err != nil {
+		return nil, err
+	}
+	return &wl, nil
+}
+
+func (r *WordlistRepository) List() ([]*models.Wordlist, error) {
+	var wlList []*models.Wordlist
+	err := r.db.Order("category, name").Find(&wlList).Error
+	return wlList, err
+}
+
+func (r *WordlistRepository) ListByCategory(category string) ([]*models.Wordlist, error) {
+	var wlList []*models.Wordlist
+	err := r.db.Where("category = ?", category).
+		Order("name").Find(&wlList).Error
+	return wlList, err
+}
+
+func (r *WordlistRepository) Update(wl *models.Wordlist) error {
+	wl.UpdatedAt = time.Now()
+	return r.db.Save(wl).Error
+}
+
+func (r *WordlistRepository) Delete(id uuid.UUID) error {
+	return r.db.Delete(&models.Wordlist{}, "id = ?", id).Error
+}

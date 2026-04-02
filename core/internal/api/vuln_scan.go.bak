@@ -1,0 +1,388 @@
+package api
+
+import (
+	"encoding/json"
+	"net/http"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/kunlun-sec/lunying/internal/models"
+	"github.com/kunlun-sec/lunying/internal/service"
+)
+
+type VulnScanHandler struct {
+	vulnScanService *service.VulnScanService
+}
+
+func NewVulnScanHandler(vulnScanService *service.VulnScanService) *VulnScanHandler {
+	return &VulnScanHandler{
+		vulnScanService: vulnScanService,
+	}
+}
+
+func (h *VulnScanHandler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/vuln-scan/tasks", h.handleScanTasks)
+	mux.HandleFunc("/api/vuln-scan/tasks/", h.handleScanTaskDetail)
+	mux.HandleFunc("/api/vuln-scan/results", h.handleScanResults)
+	mux.HandleFunc("/api/vuln-scan/results/", h.handleScanResultDetail)
+	mux.HandleFunc("/api/vuln-scan/configs", h.handleListScanConfigs)
+	mux.HandleFunc("/api/vuln-scan/configs/default", h.handleGetDefaultConfig)
+	mux.HandleFunc("/api/vuln-scan/pocs", h.handleListPOCs)
+	mux.HandleFunc("/api/vuln-scan/chains/", h.handleAnalyzeVulnChains)
+	mux.HandleFunc("/api/vuln-scan/waf-bypass", h.handleGenerateWAFBypassPayloads)
+}
+
+func (h *VulnScanHandler) handleScanTasks(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		h.handleCreateScanTask(w, r)
+	case http.MethodGet:
+		targetIDStr := r.URL.Query().Get("target_id")
+		if targetIDStr != "" {
+			h.handleListScanTasks(w, r, targetIDStr)
+		} else {
+			respondError(w, http.StatusBadRequest, "需要提供target_id参数")
+		}
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *VulnScanHandler) handleScanTaskDetail(w http.ResponseWriter, r *http.Request) {
+	pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/vuln-scan/tasks/"), "/")
+	if len(pathParts) < 1 || pathParts[0] == "" {
+		respondError(w, http.StatusBadRequest, "无效的请求")
+		return
+	}
+
+	idStr := pathParts[0]
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的任务ID")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		h.handleGetScanTask(w, r, id)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *VulnScanHandler) handleScanResults(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		taskIDStr := r.URL.Query().Get("task_id")
+		if taskIDStr != "" {
+			h.handleGetScanResults(w, r, taskIDStr)
+		} else {
+			respondError(w, http.StatusBadRequest, "需要提供task_id参数")
+		}
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *VulnScanHandler) handleScanResultDetail(w http.ResponseWriter, r *http.Request) {
+	pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/vuln-scan/results/"), "/")
+	if len(pathParts) < 1 || pathParts[0] == "" {
+		respondError(w, http.StatusBadRequest, "无效的请求")
+		return
+	}
+
+	idStr := pathParts[0]
+	id, err := uuid.Parse(idStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的结果ID")
+		return
+	}
+
+	if len(pathParts) >= 2 {
+		switch pathParts[1] {
+		case "status":
+			if r.Method == http.MethodPut {
+				h.handleUpdateResultStatus(w, r, id)
+			}
+			return
+		case "ai-verify":
+			if r.Method == http.MethodPost {
+				h.handleAIVerifyResult(w, r, id)
+			}
+			return
+		}
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		h.handleGetScanResult(w, r, id)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (h *VulnScanHandler) handleAnalyzeVulnChains(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	pathParts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/vuln-scan/chains/target/"), "/")
+	if len(pathParts) < 1 || pathParts[0] == "" {
+		respondError(w, http.StatusBadRequest, "无效的请求")
+		return
+	}
+
+	targetIDStr := pathParts[0]
+	targetID, err := uuid.Parse(targetIDStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的目标ID")
+		return
+	}
+
+	chains, err := h.vulnScanService.AnalyzeVulnerabilityChains(targetID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "分析漏洞链失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"chains": chains,
+	})
+}
+
+func (h *VulnScanHandler) handleCreateScanTask(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TargetID       string  `json:"target_id"`
+		ConfigID       *string `json:"config_id"`
+		Mode           string  `json:"mode"`
+		SeverityFilter string  `json:"severity_filter"`
+		TagsFilter     string  `json:"tags_filter"`
+		Concurrency    int     `json:"concurrency"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "无效的请求参数")
+		return
+	}
+
+	targetID, err := uuid.Parse(req.TargetID)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的目标ID")
+		return
+	}
+
+	var configID *uuid.UUID
+	if req.ConfigID != nil {
+		cid, err := uuid.Parse(*req.ConfigID)
+		if err != nil {
+			respondError(w, http.StatusBadRequest, "无效的配置ID")
+			return
+		}
+		configID = &cid
+	}
+
+	if req.Mode == "" {
+		req.Mode = "fast"
+	}
+
+	if req.Concurrency <= 0 {
+		req.Concurrency = 5
+	}
+
+	task, err := h.vulnScanService.CreateScanTask(
+		targetID,
+		configID,
+		req.Mode,
+		req.SeverityFilter,
+		req.TagsFilter,
+		req.Concurrency,
+	)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "创建扫描任务失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusCreated, task)
+}
+
+func (h *VulnScanHandler) handleListScanTasks(w http.ResponseWriter, r *http.Request, targetIDStr string) {
+	targetID, err := uuid.Parse(targetIDStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的目标ID")
+		return
+	}
+
+	tasks, err := h.vulnScanService.ListScanTasks(targetID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "获取扫描任务失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"tasks": tasks,
+	})
+}
+
+func (h *VulnScanHandler) handleGetScanTask(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	task, err := h.vulnScanService.GetScanTask(id)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "任务未找到")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, task)
+}
+
+func (h *VulnScanHandler) handleGetScanResults(w http.ResponseWriter, r *http.Request, taskIDStr string) {
+	taskID, err := uuid.Parse(taskIDStr)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, "无效的任务ID")
+		return
+	}
+
+	results, err := h.vulnScanService.GetScanResults(taskID)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "获取扫描结果失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"results": results,
+	})
+}
+
+func (h *VulnScanHandler) handleGetScanResult(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	result, err := h.vulnScanService.scanResultRepo.GetByID(id)
+	if err != nil {
+		respondError(w, http.StatusNotFound, "结果未找到")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, result)
+}
+
+func (h *VulnScanHandler) handleUpdateResultStatus(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	var req struct {
+		Status     string `json:"status"`
+		Notes      string `json:"notes"`
+		VerifiedBy string `json:"verified_by"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "无效的请求参数")
+		return
+	}
+
+	validStatuses := map[string]bool{
+		"unconfirmed":    true,
+		"confirmed":      true,
+		"false_positive": true,
+		"ignored":        true,
+		"verified":       true,
+	}
+
+	if !validStatuses[req.Status] {
+		respondError(w, http.StatusBadRequest, "无效的状态")
+		return
+	}
+
+	result, err := h.vulnScanService.VerifyResult(id, req.Status, req.Notes, req.VerifiedBy)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "更新结果状态失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, result)
+}
+
+func (h *VulnScanHandler) handleAIVerifyResult(w http.ResponseWriter, r *http.Request, id uuid.UUID) {
+	result, err := h.vulnScanService.AIVerifyResult(id)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "AI验证失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, result)
+}
+
+func (h *VulnScanHandler) handleListScanConfigs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	configs, err := h.vulnScanService.GetScanConfigs()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "获取扫描配置失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"configs": configs,
+	})
+}
+
+func (h *VulnScanHandler) handleGetDefaultConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	config, err := h.vulnScanService.scanConfigRepo.GetDefault()
+	if err != nil {
+		respondError(w, http.StatusNotFound, "默认配置未找到")
+		return
+	}
+
+	respondJSON(w, http.StatusOK, config)
+}
+
+func (h *VulnScanHandler) handleListPOCs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	pocs, err := h.vulnScanService.GetPOCs()
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "获取POC列表失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"pocs": pocs,
+	})
+}
+
+func (h *VulnScanHandler) handleGenerateWAFBypassPayloads(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Category string `json:"category"`
+		Payload  string `json:"payload"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, "无效的请求参数")
+		return
+	}
+
+	if req.Category == "" || req.Payload == "" {
+		respondError(w, http.StatusBadRequest, "请提供类别和原始Payload")
+		return
+	}
+
+	payloads, err := h.vulnScanService.GenerateWAFBypassPayloads(req.Category, req.Payload)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, "生成WAF绕过Payload失败: "+err.Error())
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]interface{}{
+		"payloads": payloads,
+	})
+}
