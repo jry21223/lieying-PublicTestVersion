@@ -7,8 +7,16 @@ import (
 	"strings"
 )
 
+// AIClient 统一的AI客户端接口
+type AIClient interface {
+	IsAvailable() bool
+	Chat(messages []Message) (string, error)
+	Generate(prompt string) (string, error)
+	ListModels() ([]OllamaModel, error)
+}
+
 type Assistant struct {
-	client    *OllamaClient
+	client    AIClient
 	analyzer  *VulnerabilityAnalyzer
 	pocGen    *POCGenerator
 	context   []Message
@@ -25,6 +33,17 @@ func NewAssistant(client *OllamaClient) *Assistant {
 	}
 }
 
+// NewAssistantWithClient 使用任意客户端创建助手
+func NewAssistantWithClient(client AIClient) *Assistant {
+	return &Assistant{
+		client:    client,
+		analyzer:  nil, // 分析器和POC生成器需要特定客户端
+		pocGen:    nil,
+		context:   []Message{},
+		isRunning: false,
+	}
+}
+
 func (a *Assistant) StartInteractiveMode() {
 	a.isRunning = true
 
@@ -35,16 +54,20 @@ func (a *Assistant) StartInteractiveMode() {
 	fmt.Println()
 
 	if !a.client.IsAvailable() {
-		fmt.Println("⚠️  警告：Ollama服务未启动")
-		fmt.Println("请确保Ollama已安装并运行：")
+		fmt.Println("⚠️  警告：AI服务未正确配置")
+		fmt.Println()
+		fmt.Println("使用 Ollama:")
 		fmt.Println("  1. 安装Ollama: https://ollama.com")
-		fmt.Println("  2. 启动Ollama服务")
+		fmt.Println("  2. 启动Ollama服务: ollama serve")
 		fmt.Println("  3. 拉取模型: ollama pull qwen2.5:14b")
 		fmt.Println()
-		fmt.Println("你可以继续使用其他功能，但AI功能将不可用。")
+		fmt.Println("使用 DeepSeek/OpenAI:")
+		fmt.Println("  1. 设置环境变量: export OPENAI_API_KEY=your_key")
+		fmt.Println("  2. 可选设置: export OPENAI_BASE_URL=https://api.deepseek.com")
 		fmt.Println()
+		return
 	} else {
-		fmt.Println("✅ Ollama连接正常")
+		fmt.Println("✅ AI服务连接正常")
 		fmt.Println()
 	}
 
@@ -96,8 +119,7 @@ func (a *Assistant) handleInput(input string) {
 
 func (a *Assistant) chat(input string) {
 	if !a.client.IsAvailable() {
-		fmt.Println("❌ Ollama服务不可用，无法使用AI功能")
-		fmt.Println("请确保Ollama已启动: ollama serve")
+		fmt.Println("❌ AI服务不可用")
 		return
 	}
 
@@ -141,7 +163,12 @@ func (a *Assistant) chat(input string) {
 
 func (a *Assistant) AnalyzeVulnerabilities(vulns []map[string]interface{}) {
 	if !a.client.IsAvailable() {
-		fmt.Println("❌ Ollama服务不可用")
+		fmt.Println("❌ AI服务不可用")
+		return
+	}
+
+	if a.analyzer == nil {
+		fmt.Println("❌ 此功能需要 Ollama 客户端")
 		return
 	}
 
@@ -167,7 +194,12 @@ func (a *Assistant) AnalyzeVulnerabilities(vulns []map[string]interface{}) {
 
 func (a *Assistant) GeneratePOC(vulnType, description, url string) {
 	if !a.client.IsAvailable() {
-		fmt.Println("❌ Ollama服务不可用")
+		fmt.Println("❌ AI服务不可用")
+		return
+	}
+
+	if a.pocGen == nil {
+		fmt.Println("❌ 此功能需要 Ollama 客户端")
 		return
 	}
 
@@ -198,7 +230,12 @@ func (a *Assistant) GeneratePOC(vulnType, description, url string) {
 
 func (a *Assistant) GenerateWAFBypass(originalPayload, wafType string) {
 	if !a.client.IsAvailable() {
-		fmt.Println("❌ Ollama服务不可用")
+		fmt.Println("❌ AI服务不可用")
+		return
+	}
+
+	if a.pocGen == nil {
+		fmt.Println("❌ 此功能需要 Ollama 客户端")
 		return
 	}
 
@@ -218,7 +255,12 @@ func (a *Assistant) GenerateWAFBypass(originalPayload, wafType string) {
 
 func (a *Assistant) CheckFalsePositive(vuln map[string]interface{}) {
 	if !a.client.IsAvailable() {
-		fmt.Println("❌ Ollama服务不可用")
+		fmt.Println("❌ AI服务不可用")
+		return
+	}
+
+	if a.analyzer == nil {
+		fmt.Println("❌ 此功能需要 Ollama 客户端")
 		return
 	}
 
@@ -241,7 +283,12 @@ func (a *Assistant) CheckFalsePositive(vuln map[string]interface{}) {
 
 func (a *Assistant) GenerateAttackPath(target string, vulns []map[string]interface{}) {
 	if !a.client.IsAvailable() {
-		fmt.Println("❌ Ollama服务不可用")
+		fmt.Println("❌ AI服务不可用")
+		return
+	}
+
+	if a.analyzer == nil {
+		fmt.Println("❌ 此功能需要 Ollama 客户端")
 		return
 	}
 
@@ -262,7 +309,7 @@ func (a *Assistant) showHelp() {
 	fmt.Println("=====================================")
 	fmt.Println("基本命令：")
 	fmt.Println("  help      - 显示帮助")
-	fmt.Println("  status    - 检查Ollama状态")
+	fmt.Println("  status    - 检查服务状态")
 	fmt.Println("  clear     - 清除对话上下文")
 	fmt.Println("  exit      - 退出")
 	fmt.Println()
@@ -279,17 +326,16 @@ func (a *Assistant) showStatus() {
 	fmt.Println("\n📊 系统状态：")
 	fmt.Println("=====================================")
 	if a.client.IsAvailable() {
-		fmt.Println("✅ Ollama服务: 运行中")
+		fmt.Println("✅ AI服务: 已连接")
 		models, err := a.client.ListModels()
-		if err == nil {
+		if err == nil && len(models) > 0 {
 			fmt.Printf("📦 可用模型: %d 个\n", len(models))
 			for _, m := range models {
 				fmt.Printf("   - %s\n", m.Name)
 			}
 		}
 	} else {
-		fmt.Println("❌ Ollama服务: 未启动")
-		fmt.Println("   请运行: ollama serve")
+		fmt.Println("❌ AI服务: 未配置")
 	}
 	fmt.Printf("💬 对话历史: %d 条消息\n", len(a.context))
 	fmt.Println("=====================================")

@@ -53,31 +53,31 @@ func (sm *ScanManager) RunFullScan() (*ScanResult, error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		sm.runNucleiScan()
+		sm.RunNucleiScan()
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		sm.runSQLiScan()
+		sm.RunSQLiScan()
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		sm.runXSSScan()
+		sm.RunXSSScan()
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		sm.runUploadScan()
+		sm.RunUploadScan()
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		sm.runUnauthScan()
+		sm.RunUnauthScan()
 	}()
 
 	wg.Wait()
@@ -97,7 +97,7 @@ func (sm *ScanManager) RunFullScan() (*ScanResult, error) {
 	return sm.results, nil
 }
 
-func (sm *ScanManager) runNucleiScan() {
+func (sm *ScanManager) RunNucleiScan() {
 	fmt.Println("[1/5] 开始Nuclei漏洞扫描...")
 	scanner := NewNucleiScanner()
 	scanner.AddTarget(sm.target)
@@ -114,7 +114,7 @@ func (sm *ScanManager) runNucleiScan() {
 	fmt.Printf("[1/5] Nuclei扫描完成，发现 %d 个漏洞\n", len(results))
 }
 
-func (sm *ScanManager) runSQLiScan() {
+func (sm *ScanManager) RunSQLiScan() {
 	fmt.Println("[2/5] 开始SQL注入检测...")
 	scanner := NewSQLiScanner(sm.target)
 	results, err := scanner.Scan()
@@ -130,7 +130,7 @@ func (sm *ScanManager) runSQLiScan() {
 	fmt.Printf("[2/5] SQL注入检测完成，发现 %d 个漏洞\n", len(results))
 }
 
-func (sm *ScanManager) runXSSScan() {
+func (sm *ScanManager) RunXSSScan() {
 	fmt.Println("[3/5] 开始XSS检测...")
 	scanner := NewXSSScanner(sm.target)
 	results, err := scanner.Scan()
@@ -146,7 +146,7 @@ func (sm *ScanManager) runXSSScan() {
 	fmt.Printf("[3/5] XSS检测完成，发现 %d 个漏洞\n", len(results))
 }
 
-func (sm *ScanManager) runUploadScan() {
+func (sm *ScanManager) RunUploadScan() {
 	fmt.Println("[4/5] 开始文件上传漏洞检测...")
 	scanner := NewUploadScanner(sm.target)
 	results, err := scanner.Scan()
@@ -162,7 +162,7 @@ func (sm *ScanManager) runUploadScan() {
 	fmt.Printf("[4/5] 文件上传漏洞检测完成，发现 %d 个漏洞\n", len(results))
 }
 
-func (sm *ScanManager) runUnauthScan() {
+func (sm *ScanManager) RunUnauthScan() {
 	fmt.Println("[5/5] 开始未授权访问检测...")
 	scanner := NewUnauthScanner(sm.target)
 	results, err := scanner.Scan()

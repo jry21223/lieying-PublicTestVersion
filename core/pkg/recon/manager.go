@@ -74,25 +74,25 @@ func (rm *ReconManager) RunFullRecon() (*ReconResult, error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		rm.runSubdomainEnum(rootDomain)
+		rm.RunSubdomainEnum(rootDomain)
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		rm.runPortScan(rm.target)
+		rm.RunPortScan(rm.target)
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		rm.runFingerprint(rm.target)
+		rm.RunFingerprint(rm.target)
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		rm.runDirScan(rm.target)
+		rm.RunDirScan(rm.target)
 	}()
 
 	wg.Wait()
@@ -114,7 +114,7 @@ func (rm *ReconManager) RunFullRecon() (*ReconResult, error) {
 	return rm.result, nil
 }
 
-func (rm *ReconManager) runSubdomainEnum(domain string) {
+func (rm *ReconManager) RunSubdomainEnum(domain string) {
 	fmt.Println("[1/4] 开始子域枚举...")
 	enum := NewSubdomainEnumerator(domain)
 	subdomains, err := enum.Enumerate()
@@ -130,7 +130,7 @@ func (rm *ReconManager) runSubdomainEnum(domain string) {
 	fmt.Printf("[1/4] 子域枚举完成，发现 %d 个子域\n", len(subdomains))
 }
 
-func (rm *ReconManager) runPortScan(host string) {
+func (rm *ReconManager) RunPortScan(host string) {
 	fmt.Println("[2/4] 开始端口扫描...")
 	scanner := NewPortScanner(host)
 	scanner.AddCommonPorts()
@@ -154,7 +154,7 @@ func (rm *ReconManager) runPortScan(host string) {
 	fmt.Printf("[2/4] 端口扫描完成，发现 %d 个开放端口\n", len(openPorts))
 }
 
-func (rm *ReconManager) runFingerprint(url string) {
+func (rm *ReconManager) RunFingerprint(url string) {
 	fmt.Println("[3/4] 开始Web指纹识别...")
 	fingerprinter := NewFingerprinter(url)
 	result, err := fingerprinter.Fingerprint()
@@ -178,7 +178,7 @@ func (rm *ReconManager) runFingerprint(url string) {
 	fmt.Println("[3/4] Web指纹识别完成")
 }
 
-func (rm *ReconManager) runDirScan(url string) {
+func (rm *ReconManager) RunDirScan(url string) {
 	fmt.Println("[4/4] 开始目录扫描...")
 	scanner := NewDirScanner(url)
 	scanner.AddCommonPaths()
