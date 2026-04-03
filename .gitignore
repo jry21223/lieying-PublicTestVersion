@@ -3,29 +3,42 @@ node_modules/
 
 # Build outputs
 dist/
+lieying
+lieying.exe
 
 # Environment
 .env
 .env.local
 
+# Database
+*.db
+data/
+
+# Logs
+logs/
+*.log
+
 # Executables
 *.exe
 *.dll
 *.so
-*.db
+*.dylib
 
 # IDE
-.vscode/settings.json
+.vscode/
 .idea/
+*.swp
+*.swo
 
 # System
 .DS_Store
 Thumbs.db
-*.log
 
-# Go runtime (large, not needed)
-runtime/
+# Config (keep example)
+config.yaml
+!.env.example
 
-# Build artifacts
-core/src/lieying_server.exe
-frontend/node_modules/
+# Temporary files
+*.tmp
+*.bak
+*~
