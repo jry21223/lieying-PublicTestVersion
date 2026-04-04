@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -67,5 +68,21 @@ func TestSQLiScannerDetectsInjectedDatabaseError(t *testing.T) {
 	}
 	if len(results) == 0 {
 		t.Fatal("expected SQLi finding for injected database error")
+	}
+}
+
+func TestReplaceQueryParamPreservesRepeatedParameters(t *testing.T) {
+	updated := replaceQueryParam("http://example.com/?id=1&id=2&note=a%2Bb", "id", "'")
+	parsed, err := url.Parse(updated)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	values := parsed.Query()["id"]
+	if len(values) != 2 {
+		t.Fatalf("expected duplicate id parameters to be preserved, got %q", parsed.RawQuery)
+	}
+	if values[0] != "'" || values[1] != "'" {
+		t.Fatalf("expected all id parameters to change, got %q", parsed.RawQuery)
 	}
 }

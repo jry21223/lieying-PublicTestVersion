@@ -48,6 +48,31 @@ func TestXSSScannerDetectsRawReflectedPayloadInHTML(t *testing.T) {
 	}
 }
 
+func TestXSSScannerHandlesEncodedQueryParameters(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(fmt.Sprintf("<html><body>%s|safe:%s</body></html>", r.URL.Query().Get("q"), url.QueryEscape(r.URL.Query().Get("next")))))
+	}))
+	defer server.Close()
+
+	scanner := NewXSSScanner(server.URL + "/?q=hello%20world&next=q=hello%20world")
+	scanner.httpClient = server.Client()
+	results, err := scanner.Scan()
+	if err != nil {
+		t.Fatalf("Scan() error = %v", err)
+	}
+
+	foundQ := false
+	for _, result := range results {
+		if result.Parameter == "q" && result.Type == "Reflected XSS" {
+			foundQ = true
+		}
+	}
+	if !foundQ {
+		t.Fatalf("expected reflected XSS finding for q parameter, got %+v", results)
+	}
+}
+
 func TestXSSScannerDetectsStoredXSSAfterReadback(t *testing.T) {
 	var stored string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

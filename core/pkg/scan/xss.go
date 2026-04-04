@@ -63,17 +63,14 @@ func (xs *XSSScanner) testReflectedXSS() {
 	query := parsedURL.Query()
 	for param := range query {
 		for _, payload := range xssPayloads {
-			testURL := xs.target
-			if strings.Contains(testURL, "?") {
-				testURL = strings.Replace(testURL, param+"="+query.Get(param), param+"="+url.QueryEscape(payload), 1)
-			}
+			testURL := replaceQueryParam(xs.target, param, payload)
 
 			resp, err := xs.httpClient.Get(testURL)
 			if err != nil {
 				continue
 			}
 
-			body, err := io.ReadAll(resp.Body)
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 			resp.Body.Close()
 			if err != nil {
 				continue
@@ -154,7 +151,7 @@ func (xs *XSSScanner) testStoredXSS() {
 			if err != nil {
 				continue
 			}
-			body, err := io.ReadAll(readResp.Body)
+			body, err := io.ReadAll(io.LimitReader(readResp.Body, 1024*1024))
 			readResp.Body.Close()
 			if err != nil {
 				continue

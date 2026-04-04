@@ -2,11 +2,13 @@ package scan
 
 import (
 	"bytes"
+	"crypto/md5"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -75,29 +77,7 @@ func (us *UploadScanner) testUploadForms() {
 		".php4",
 		".php5",
 		".phtml",
-		".phar",
-		".phps",
 		".pht",
-		".jsp",
-		".jspx",
-		".jsw",
-		".jsv",
-		".jspf",
-		".asp",
-		".aspx",
-		".ascx",
-		".ashx",
-		".asmx",
-		".cer",
-		".asa",
-		".cdx",
-		".htr",
-		".war",
-		".py",
-		".rb",
-		".sh",
-		".pl",
-		".cgi",
 	}
 
 	parsedURL, err := url.Parse(us.target)
@@ -115,7 +95,7 @@ func (us *UploadScanner) testUploadForms() {
 			continue
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 		resp.Body.Close()
 		if err != nil {
 			continue
@@ -127,7 +107,8 @@ func (us *UploadScanner) testUploadForms() {
 		}
 
 		for _, ext := range maliciousExtensions {
-			result, ok := us.tryDangerousUpload(form.actionURL, form.inputName, "shell"+ext)
+			filename := fmt.Sprintf("shell-%d%s", time.Now().UnixNano(), ext)
+			result, ok := us.tryDangerousUpload(form.actionURL, form.inputName, filename)
 			if ok {
 				us.results = append(us.results, result)
 				fmt.Printf("⚠️  发现文件上传漏洞: %s\n", form.actionURL)
@@ -154,9 +135,13 @@ func parseUploadForm(pageURL, body string) (uploadForm, bool) {
 		actionURL := pageURL
 		if matches := actionRegex.FindStringSubmatch(formBlock); len(matches) > 1 {
 			resolved, ok := resolveFormAction(pageURL, matches[1])
-			if ok {
-				actionURL = resolved
+			if !ok {
+				continue
 			}
+			if !isSameOrigin(pageURL, resolved) {
+				continue
+			}
+			actionURL = resolved
 		}
 
 		inputName := "file"
@@ -190,6 +175,8 @@ func resolveFormAction(pageURL, action string) (string, bool) {
 }
 
 func (us *UploadScanner) tryDangerousUpload(uploadURL, inputName, filename string) (UploadResult, bool) {
+	executionMarker := executionMarkerForFilename(filename)
+
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 
@@ -198,8 +185,13 @@ func (us *UploadScanner) tryDangerousUpload(uploadURL, inputName, filename strin
 		return UploadResult{}, false
 	}
 
-	_, _ = part.Write([]byte("<?php echo 'test'; ?>"))
-	writer.Close()
+	_, err = part.Write([]byte("<?php echo md5('" + markerForFilename(filename) + "'); ?>"))
+	if err != nil {
+		return UploadResult{}, false
+	}
+	if err := writer.Close(); err != nil {
+		return UploadResult{}, false
+	}
 
 	req, err := http.NewRequest(http.MethodPost, uploadURL, body)
 	if err != nil {
@@ -213,7 +205,7 @@ func (us *UploadScanner) tryDangerousUpload(uploadURL, inputName, filename strin
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
 		return UploadResult{}, false
 	}
@@ -226,16 +218,107 @@ func (us *UploadScanner) tryDangerousUpload(uploadURL, inputName, filename strin
 		return UploadResult{}, false
 	}
 
+	uploadedFileURL, ok := extractUploadedFileURL(uploadURL, string(respBody))
+	if !ok {
+		return UploadResult{}, false
+	}
+	if !us.isUploadedFileReachable(uploadURL, uploadedFileURL, executionMarker) {
+		return UploadResult{}, false
+	}
+
 	return UploadResult{
-		URL:        uploadURL,
+		URL:        uploadedFileURL,
 		FormAction: uploadURL,
 		InputName:  inputName,
 		Type:       "File Upload",
 		Payload:    filename,
-		Evidence:   fmt.Sprintf("上传危险扩展文件后服务端返回成功迹象: %s", strings.TrimSpace(string(respBody))),
+		Evidence:   fmt.Sprintf("上传危险扩展文件后返回成功迹象，且文件可访问并包含上传标记: %s", uploadedFileURL),
 		Severity:   "High",
 		Confirmed:  true,
 	}, true
+}
+
+func markerForFilename(filename string) string {
+	base := strings.TrimSuffix(path.Base(filename), path.Ext(filename))
+	return strings.Replace(base, "shell-", "lieying-upload-marker-", 1)
+}
+
+func executionMarkerForFilename(filename string) string {
+	sum := md5.Sum([]byte(markerForFilename(filename)))
+	return fmt.Sprintf("%x", sum)
+}
+
+func extractUploadedFileURL(uploadURL, responseBody string) (string, bool) {
+	pathRegex := regexp.MustCompile(`(?i)(?:"|')(?:path|url)(?:"|')\s*:\s*(?:"|')([^"']+)(?:"|')`)
+	matches := pathRegex.FindStringSubmatch(responseBody)
+	if len(matches) <= 1 {
+		return "", false
+	}
+
+	resolved, ok := resolveFormAction(uploadURL, matches[1])
+	if !ok {
+		return "", false
+	}
+	if !isSameOrigin(uploadURL, resolved) {
+		return "", false
+	}
+	return resolved, true
+}
+
+func isSameOrigin(baseURL, targetURL string) bool {
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	target, err := url.Parse(targetURL)
+	if err != nil {
+		return false
+	}
+	return base.Scheme == target.Scheme && effectivePort(base) == effectivePort(target) && base.Hostname() == target.Hostname()
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if u.Scheme == "https" {
+		return "443"
+	}
+	if u.Scheme == "http" {
+		return "80"
+	}
+	return ""
+}
+
+func (us *UploadScanner) isUploadedFileReachable(uploadURL, uploadedFileURL, marker string) bool {
+	if !isSameOrigin(uploadURL, uploadedFileURL) {
+		return false
+	}
+
+	client := *us.httpClient
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+
+	resp, err := client.Get(uploadedFileURL)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	if !isSameOrigin(uploadURL, resp.Request.URL.String()) {
+		return false
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return false
+	}
+
+	return strings.Contains(string(body), marker)
 }
 
 func (us *UploadScanner) GetResults() []UploadResult {

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -30,15 +31,15 @@ type NetworkEngine struct {
 }
 
 type EngineConfig struct {
-	Proxy         string     `json:"proxy"`
-	ProxyAuth     *ProxyAuth `json:"proxy_auth"`
-	Concurrency   int        `json:"concurrency"`
-	QPS           float64    `json:"qps"`
-	Timeout       int        `json:"timeout"`
-	UserAgent     string     `json:"user_agent"`
-	Insecure      bool       `json:"insecure"`
-	FollowRedirects bool     `json:"follow_redirects"`
-	Headers       map[string]string `json:"headers"`
+	Proxy           string            `json:"proxy"`
+	ProxyAuth       *ProxyAuth        `json:"proxy_auth"`
+	Concurrency     int               `json:"concurrency"`
+	QPS             float64           `json:"qps"`
+	Timeout         int               `json:"timeout"`
+	UserAgent       string            `json:"user_agent"`
+	Insecure        bool              `json:"insecure"`
+	FollowRedirects bool              `json:"follow_redirects"`
+	Headers         map[string]string `json:"headers"`
 }
 
 type ProxyAuth struct {
@@ -47,41 +48,41 @@ type ProxyAuth struct {
 }
 
 type Request struct {
-	Method    string            `json:"method"`
-	URL       string            `json:"url"`
-	Headers   map[string]string `json:"headers"`
-	Body      string            `json:"body"`
-	Timeout   int               `json:"timeout"`
-	FollowRedirects bool        `json:"follow_redirects"`
+	Method          string            `json:"method"`
+	URL             string            `json:"url"`
+	Headers         map[string]string `json:"headers"`
+	Body            string            `json:"body"`
+	Timeout         int               `json:"timeout"`
+	FollowRedirects bool              `json:"follow_redirects"`
 }
 
 type Response struct {
-	ID        string            `json:"id"`
-	URL       string            `json:"url,omitempty"`
-	Status    int               `json:"status"`
-	Headers   map[string]string `json:"headers"`
-	Body      string            `json:"body"`
-	Duration  int64             `json:"duration"`
-	Error     string            `json:"error,omitempty"`
+	ID       string            `json:"id"`
+	URL      string            `json:"url,omitempty"`
+	Status   int               `json:"status"`
+	Headers  map[string]string `json:"headers"`
+	Body     string            `json:"body"`
+	Duration int64             `json:"duration"`
+	Error    string            `json:"error,omitempty"`
 }
 
 type PortScanResult struct {
-	Port  int    `json:"port"`
-	Open  bool   `json:"open"`
+	Port    int    `json:"port"`
+	Open    bool   `json:"open"`
 	Service string `json:"service"`
-	Banner string `json:"banner"`
+	Banner  string `json:"banner"`
 }
 
 func NewNetworkEngine(config *EngineConfig) (*NetworkEngine, error) {
 	if config == nil {
 		config = &EngineConfig{
-			Concurrency:    10,
-			QPS:           50,
-			Timeout:       30,
-			UserAgent:     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+			Concurrency:     10,
+			QPS:             50,
+			Timeout:         30,
+			UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 			FollowRedirects: true,
-			Insecure:     false,
-			Headers:      make(map[string]string),
+			Insecure:        false,
+			Headers:         make(map[string]string),
 		}
 	}
 
@@ -257,7 +258,7 @@ func (e *NetworkEngine) ScanPort(ip string, port int, timeout time.Duration) *Po
 		Open: false,
 	}
 
-	addr := fmt.Sprintf("%s:%d", ip, port)
+	addr := net.JoinHostPort(ip, strconv.Itoa(port))
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return result
@@ -409,9 +410,9 @@ func (e *NetworkEngine) BatchRequest(ctx context.Context, requests []*Request, c
 			resp, err := e.DoRequest(ctx, r)
 			if err != nil {
 				results[idx] = &Response{
-					ID:     uuid.New().String(),
-					Error:  err.Error(),
-					URL:    r.URL,
+					ID:    uuid.New().String(),
+					Error: err.Error(),
+					URL:   r.URL,
 				}
 			} else {
 				results[idx] = resp
@@ -425,29 +426,29 @@ func (e *NetworkEngine) BatchRequest(ctx context.Context, requests []*Request, c
 
 func guessService(port int) string {
 	commonPorts := map[int]string{
-		20:   "ftp-data",
-		21:   "ftp",
-		22:   "ssh",
-		23:   "telnet",
-		25:   "smtp",
-		53:   "dns",
-		80:   "http",
-		110:  "pop3",
-		143:  "imap",
-		443:  "https",
-		465:  "smtps",
-		587:  "smtp-submission",
-		993:  "imaps",
-		995:  "pop3s",
-		1433: "mssql",
-		1521: "oracle",
-		3306: "mysql",
-		3389: "rdp",
-		5432: "postgresql",
-		5900: "vnc",
-		6379: "redis",
-		8080: "http-proxy",
-		8443: "https-alt",
+		20:    "ftp-data",
+		21:    "ftp",
+		22:    "ssh",
+		23:    "telnet",
+		25:    "smtp",
+		53:    "dns",
+		80:    "http",
+		110:   "pop3",
+		143:   "imap",
+		443:   "https",
+		465:   "smtps",
+		587:   "smtp-submission",
+		993:   "imaps",
+		995:   "pop3s",
+		1433:  "mssql",
+		1521:  "oracle",
+		3306:  "mysql",
+		3389:  "rdp",
+		5432:  "postgresql",
+		5900:  "vnc",
+		6379:  "redis",
+		8080:  "http-proxy",
+		8443:  "https-alt",
 		27017: "mongodb",
 	}
 

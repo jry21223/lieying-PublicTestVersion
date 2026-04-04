@@ -98,7 +98,7 @@ func (ss *SQLiScanner) testErrorBased() {
 	query := parsedURL.Query()
 	for param := range query {
 		for _, payload := range errorPayloads {
-			testURL := replaceQueryParam(ss.target, param, query.Get(param), payload)
+			testURL := replaceQueryParam(ss.target, param, payload)
 			snapshot, err := ss.fetchSnapshot(testURL)
 			if err != nil {
 				continue
@@ -149,7 +149,7 @@ func (ss *SQLiScanner) testTimeBased() {
 	query := parsedURL.Query()
 	for param := range query {
 		for _, tp := range timePayloads {
-			testURL := replaceQueryParam(ss.target, param, query.Get(param), tp.Payload)
+			testURL := replaceQueryParam(ss.target, param, tp.Payload)
 			snapshot, err := ss.fetchSnapshot(testURL)
 			if err != nil {
 				continue
@@ -207,8 +207,8 @@ func (ss *SQLiScanner) testBooleanBased() {
 	query := parsedURL.Query()
 	for param := range query {
 		for _, bp := range boolPayloads {
-			trueURL := replaceQueryParam(ss.target, param, query.Get(param), bp.True)
-			falseURL := replaceQueryParam(ss.target, param, query.Get(param), bp.False)
+			trueURL := replaceQueryParam(ss.target, param, bp.True)
+			falseURL := replaceQueryParam(ss.target, param, bp.False)
 
 			trueSnapshot, err := ss.fetchSnapshot(trueURL)
 			if err != nil {
@@ -255,7 +255,7 @@ func (ss *SQLiScanner) fetchSnapshot(target string) (responseSnapshot, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
 		return responseSnapshot{}, err
 	}
@@ -267,11 +267,38 @@ func (ss *SQLiScanner) fetchSnapshot(target string) (responseSnapshot, error) {
 	}, nil
 }
 
-func replaceQueryParam(target, param, originalValue, payload string) string {
-	if !strings.Contains(target, "?") {
+func replaceQueryParam(target, param, payload string) string {
+	parsedURL, err := url.Parse(target)
+	if err != nil {
 		return target
 	}
-	return strings.Replace(target, param+"="+originalValue, param+"="+url.QueryEscape(payload), 1)
+	if parsedURL.RawQuery == "" {
+		return target
+	}
+
+	parts := strings.Split(parsedURL.RawQuery, "&")
+	replaced := false
+	encodedPayload := url.QueryEscape(payload)
+
+	for i, part := range parts {
+		key, _, _ := strings.Cut(part, "=")
+		decodedKey, err := url.QueryUnescape(key)
+		if err != nil {
+			decodedKey = key
+		}
+		if decodedKey != param {
+			continue
+		}
+		parts[i] = key + "=" + encodedPayload
+		replaced = true
+	}
+
+	if !replaced {
+		return target
+	}
+
+	parsedURL.RawQuery = strings.Join(parts, "&")
+	return parsedURL.String()
 }
 
 func absInt(value int) int {
