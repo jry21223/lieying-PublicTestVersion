@@ -40,6 +40,24 @@ func TestParseUploadFormRejectsCrossOriginAction(t *testing.T) {
 	}
 }
 
+func TestParseUploadFormAcceptsFlexibleFileInputAttributes(t *testing.T) {
+	cases := []string{
+		`<form action="/upload" method="post" enctype="multipart/form-data"><input type="file" name="f"></form>`,
+		`<form action="/upload" method="post" enctype="multipart/form-data"><INPUT TYPE = "FILE" NAME = "f"></form>`,
+		`<form action="/upload" method="post" enctype="multipart/form-data"><input name='f'   type = file></form>`,
+	}
+
+	for _, body := range cases {
+		form, ok := parseUploadForm("https://example.com/upload", body)
+		if !ok {
+			t.Fatalf("expected upload form to be parsed for %q", body)
+		}
+		if form.inputName != "f" {
+			t.Fatalf("expected input name f, got %+v", form)
+		}
+	}
+}
+
 func TestUploadScannerUsesFormActionAndInputName(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {

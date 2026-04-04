@@ -86,3 +86,18 @@ func TestReplaceQueryParamPreservesRepeatedParameters(t *testing.T) {
 		t.Fatalf("expected all id parameters to change, got %q", parsed.RawQuery)
 	}
 }
+
+func TestReplaceQueryParamHandlesEncodedValues(t *testing.T) {
+	updated := replaceQueryParam("http://example.com/?q=a%2Bb&name=John+Doe", "q", "<script>alert(1)</script>")
+	parsed, err := url.Parse(updated)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	if got := parsed.Query().Get("q"); got != "<script>alert(1)</script>" {
+		t.Fatalf("expected encoded parameter to be replaced, got %q", got)
+	}
+	if got := parsed.Query().Get("name"); got != "John Doe" {
+		t.Fatalf("expected unrelated parameter to stay unchanged, got %q", got)
+	}
+}

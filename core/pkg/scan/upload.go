@@ -127,11 +127,6 @@ func parseUploadForm(pageURL, body string) (uploadForm, bool) {
 
 	forms := formBlockRegex.FindAllString(body, -1)
 	for _, formBlock := range forms {
-		lowerForm := strings.ToLower(formBlock)
-		if !strings.Contains(lowerForm, "type=\"file\"") && !strings.Contains(lowerForm, "type='file'") && !strings.Contains(lowerForm, "type=file") {
-			continue
-		}
-
 		actionURL := pageURL
 		if matches := actionRegex.FindStringSubmatch(formBlock); len(matches) > 1 {
 			resolved, ok := resolveFormAction(pageURL, matches[1])
@@ -145,15 +140,20 @@ func parseUploadForm(pageURL, body string) (uploadForm, bool) {
 		}
 
 		inputName := "file"
+		foundFileInput := false
 		inputTags := inputTagRegex.FindAllString(formBlock, -1)
 		for _, inputTag := range inputTags {
 			if !fileTypeRegex.MatchString(inputTag) {
 				continue
 			}
+			foundFileInput = true
 			if matches := nameRegex.FindStringSubmatch(inputTag); len(matches) > 1 {
 				inputName = matches[1]
 			}
 			break
+		}
+		if !foundFileInput {
+			continue
 		}
 
 		return uploadForm{actionURL: actionURL, inputName: inputName}, true

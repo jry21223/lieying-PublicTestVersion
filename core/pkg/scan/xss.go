@@ -202,19 +202,18 @@ func isEscapedReflection(body, payload string) bool {
 }
 
 func containsDangerousHTMLContext(body, payload string) bool {
-	dangerousPatterns := []string{
-		"<script>alert('xss')</script>",
-		"<script>alert('storedxss')</script>",
-		"onerror=alert('xss')",
-		"onerror=alert('storedxss')",
-		"onload=alert('xss')",
-		"onload=alert('storedxss')",
-		"href=javascript:alert('xss')",
-	}
 	bodyLower := strings.ToLower(body)
 	payloadLower := strings.ToLower(payload)
-	for _, pattern := range dangerousPatterns {
-		if strings.Contains(payloadLower, pattern) && strings.Contains(bodyLower, pattern) {
+	dangerousFragments := []string{
+		"<script",
+		"onerror=",
+		"onerror =",
+		"onload=",
+		"onload =",
+		"javascript:",
+	}
+	for _, fragment := range dangerousFragments {
+		if strings.Contains(payloadLower, fragment) && strings.Contains(bodyLower, fragment) {
 			return true
 		}
 	}

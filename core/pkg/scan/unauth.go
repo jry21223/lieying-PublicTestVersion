@@ -113,7 +113,7 @@ func (us *UnauthScanner) testAdminPaths() {
 		if resp.StatusCode != http.StatusOK || !strings.Contains(contentType, "html") {
 			continue
 		}
-		if looksLikeLoginPage(bodyLower) || looksLikePublicDoc(bodyLower) {
+		if looksLikeLoginPage(contentType, bodyLower) || looksLikePublicDoc(bodyLower) {
 			continue
 		}
 		if !containsAny(bodyLower, adminIndicators) {
@@ -187,7 +187,7 @@ func (us *UnauthScanner) testAPIEndpoints() {
 
 		bodyLower := strings.ToLower(body)
 		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
-		if resp.StatusCode != http.StatusOK || looksLikeLoginPage(bodyLower) {
+		if resp.StatusCode != http.StatusOK || looksLikeLoginPage(contentType, bodyLower) {
 			continue
 		}
 		if isPublicDocumentationPath(path) {
@@ -299,21 +299,28 @@ func containsAny(body string, indicators []string) bool {
 	return false
 }
 
-func looksLikeLoginPage(body string) bool {
-	loginIndicators := []string{
-		"login",
-		"sign in",
-		"signin",
-		"password",
-		"username",
-		"登录",
-		"密码",
-		"用户名",
-		"统一身份认证",
-		"cas",
-		"sso",
+func looksLikeLoginPage(contentType, body string) bool {
+	if !strings.Contains(contentType, "html") {
+		return false
 	}
-	return containsAny(body, loginIndicators)
+
+	passwordFieldIndicators := []string{
+		`type="password"`,
+		`type='password'`,
+		`type=password`,
+		`name="password"`,
+		`name='password'`,
+		`name=password`,
+	}
+	authIndicators := []string{"login", "sign in", "signin", "登录", "统一身份认证", "cas", "sso", "/login", "/auth", "/session"}
+
+	if !strings.Contains(body, "<form") {
+		return false
+	}
+	if containsAny(body, authIndicators) {
+		return true
+	}
+	return containsAny(body, passwordFieldIndicators)
 }
 
 func looksLikePublicDoc(body string) bool {

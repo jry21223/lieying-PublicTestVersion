@@ -2,6 +2,7 @@ package scan
 
 import (
 	"fmt"
+	"html"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -11,8 +12,8 @@ import (
 
 func TestXSSScannerIgnoresEscapedReflection(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte("received=" + url.QueryEscape(r.URL.Query().Get("q"))))
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte("<html><body>received=" + html.EscapeString(r.URL.Query().Get("q")) + "</body></html>"))
 	}))
 	defer server.Close()
 
@@ -70,6 +71,20 @@ func TestXSSScannerHandlesEncodedQueryParameters(t *testing.T) {
 	}
 	if !foundQ {
 		t.Fatalf("expected reflected XSS finding for q parameter, got %+v", results)
+	}
+}
+
+func TestContainsDangerousHTMLContextDetectsExecutableVariants(t *testing.T) {
+	cases := []string{
+		`<iframe src="javascript:alert(1)"></iframe>`,
+		`<iframe SRC = 'javascript:alert(1)'></iframe>`,
+		`<iframe src = javascript:alert(1)></iframe>`,
+	}
+
+	for _, body := range cases {
+		if !containsDangerousHTMLContext(body, body) {
+			t.Fatalf("expected dangerous executable context for %q", body)
+		}
 	}
 }
 
