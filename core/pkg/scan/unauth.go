@@ -16,13 +16,18 @@ type UnauthScanner struct {
 }
 
 type UnauthResult struct {
-	URL         string
-	Path        string
-	Type        string
-	StatusCode  int
-	Evidence    string
-	Severity    string
-	Confirmed   bool
+	URL        string
+	Path       string
+	Type       string
+	StatusCode int
+	Evidence   string
+	Severity   string
+	Confirmed  bool
+}
+
+type sensitivePathRule struct {
+	path       string
+	indicators []string
 }
 
 func NewUnauthScanner(target string) *UnauthScanner {
@@ -31,6 +36,9 @@ func NewUnauthScanner(target string) *UnauthScanner {
 		results: []UnauthResult{},
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }
@@ -75,50 +83,54 @@ func (us *UnauthScanner) testAdminPaths() {
 		"/phpmyadmin/",
 	}
 
-	parsedURL, err := url.Parse(us.target)
+	adminIndicators := []string{
+		"admin dashboard",
+		"dashboard",
+		"后台管理",
+		"管理后台",
+		"控制台",
+		"系统管理",
+		"用户管理",
+		"权限管理",
+		"management console",
+		"site administration",
+	}
+
+	baseURL, err := getBaseURL(us.target)
 	if err != nil {
 		return
 	}
 
-	baseURL := parsedURL.Scheme + "://" + parsedURL.Host
-
 	for _, path := range adminPaths {
 		testURL := baseURL + path
-		
-		resp, err := us.httpClient.Get(testURL)
+		resp, body, err := us.fetchResponse(testURL)
 		if err != nil {
 			continue
 		}
 
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
+		bodyLower := strings.ToLower(body)
+		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+		if resp.StatusCode != http.StatusOK || !strings.Contains(contentType, "html") {
+			continue
+		}
+		if looksLikeLoginPage(bodyLower) || looksLikePublicDoc(bodyLower) {
+			continue
+		}
+		if !containsAny(bodyLower, adminIndicators) {
 			continue
 		}
 
-		bodyStr := string(body)
-		
-		if resp.StatusCode == 200 {
-			if !strings.Contains(bodyStr, "login") &&
-			   !strings.Contains(bodyStr, "登录") &&
-			   !strings.Contains(bodyStr, "password") &&
-			   !strings.Contains(bodyStr, "密码") &&
-			   !strings.Contains(bodyStr, "username") &&
-			   !strings.Contains(bodyStr, "用户名") {
-				
-				result := UnauthResult{
-					URL:        testURL,
-					Path:       path,
-					Type:       "Unauthorized Admin Access",
-					StatusCode: resp.StatusCode,
-					Evidence:   "管理页面可直接访问，无需登录",
-					Severity:   "Critical",
-					Confirmed:  false,
-				}
-				us.results = append(us.results, result)
-				fmt.Printf("⚠️  发现未授权访问: %s\n", testURL)
-			}
+		result := UnauthResult{
+			URL:        testURL,
+			Path:       path,
+			Type:       "Unauthorized Admin Access",
+			StatusCode: resp.StatusCode,
+			Evidence:   "后台页面存在管理功能特征且无需登录即可访问",
+			Severity:   "Critical",
+			Confirmed:  true,
 		}
+		us.results = append(us.results, result)
+		fmt.Printf("⚠️  发现未授权访问: %s\n", testURL)
 	}
 }
 
@@ -144,93 +156,173 @@ func (us *UnauthScanner) testAPIEndpoints() {
 		"/graphql",
 	}
 
-	parsedURL, err := url.Parse(us.target)
+	apiIndicators := []string{
+		"\"users\"",
+		"\"email\"",
+		"\"username\"",
+		"\"role\"",
+		"\"password\"",
+		"\"token\"",
+		"\"config\"",
+		"\"settings\"",
+		"\"database\"",
+		"\"debug\"",
+		"\"trace\"",
+		"\"stack\"",
+		"\"admin\"",
+		"connectionstring",
+	}
+
+	baseURL, err := getBaseURL(us.target)
 	if err != nil {
 		return
 	}
 
-	baseURL := parsedURL.Scheme + "://" + parsedURL.Host
-
 	for _, path := range apiPaths {
 		testURL := baseURL + path
-		
-		resp, err := us.httpClient.Get(testURL)
+		resp, body, err := us.fetchResponse(testURL)
 		if err != nil {
 			continue
 		}
-		resp.Body.Close()
 
-		if resp.StatusCode == 200 {
-			result := UnauthResult{
-				URL:        testURL,
-				Path:       path,
-				Type:       "Unauthorized API Access",
-				StatusCode: resp.StatusCode,
-				Evidence:   "API接口可直接访问，无需认证",
-				Severity:   "High",
-				Confirmed:  false,
-			}
-			us.results = append(us.results, result)
-			fmt.Printf("⚠️  发现未授权API: %s\n", testURL)
+		bodyLower := strings.ToLower(body)
+		contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+		if resp.StatusCode != http.StatusOK || looksLikeLoginPage(bodyLower) {
+			continue
 		}
+		if isPublicDocumentationPath(path) {
+			continue
+		}
+		if !strings.Contains(contentType, "json") && !containsAny(bodyLower, apiIndicators) {
+			continue
+		}
+		if !containsAny(bodyLower, apiIndicators) {
+			continue
+		}
+
+		result := UnauthResult{
+			URL:        testURL,
+			Path:       path,
+			Type:       "Unauthorized API Access",
+			StatusCode: resp.StatusCode,
+			Evidence:   "接口响应包含敏感数据或调试/配置特征，且无需认证",
+			Severity:   "High",
+			Confirmed:  true,
+		}
+		us.results = append(us.results, result)
+		fmt.Printf("⚠️  发现未授权API: %s\n", testURL)
 	}
 }
 
 func (us *UnauthScanner) testSensitivePaths() {
-	sensitivePaths := []string{
-		"/.env",
-		"/.git/config",
-		"/.git/HEAD",
-		"/.svn/entries",
-		"/.htaccess",
-		"/.htpasswd",
-		"/config.php",
-		"/config.inc.php",
-		"/configuration.php",
-		"/wp-config.php",
-		"/database.yml",
-		"/db.conf",
-		"/application.yml",
-		"/application.properties",
-		"/settings.py",
-		"/settings.php",
-		"/robots.txt",
-		"/sitemap.xml",
-		"/crossdomain.xml",
-		"/clientaccesspolicy.xml",
-		"/.well-known/security.txt",
+	rules := []sensitivePathRule{
+		{path: "/.env", indicators: []string{"app_key", "db_password", "secret", "api_key", "password", "token"}},
+		{path: "/.git/config", indicators: []string{"[core]", "[remote ", "repositoryformatversion", "url = "}},
+		{path: "/.git/HEAD", indicators: []string{"ref:"}},
+		{path: "/.svn/entries", indicators: []string{"svn", "dir"}},
+		{path: "/.htaccess", indicators: []string{"authuserfile", "rewriteengine", "deny from all"}},
+		{path: "/.htpasswd", indicators: []string{":$apr1$", ":$2y$", ":$2a$", ":$1$"}},
+		{path: "/config.php", indicators: []string{"database", "password", "username", "host"}},
+		{path: "/config.inc.php", indicators: []string{"database", "password", "username", "host"}},
+		{path: "/configuration.php", indicators: []string{"database", "password", "username", "host"}},
+		{path: "/wp-config.php", indicators: []string{"db_name", "db_user", "db_password", "db_host"}},
+		{path: "/database.yml", indicators: []string{"adapter:", "database:", "password:", "username:"}},
+		{path: "/db.conf", indicators: []string{"database", "password", "username", "host"}},
+		{path: "/application.yml", indicators: []string{"spring:", "datasource:", "password:", "username:"}},
+		{path: "/application.properties", indicators: []string{"spring.datasource", "password=", "username="}},
+		{path: "/settings.py", indicators: []string{"secret_key", "database", "password", "allowed_hosts"}},
+		{path: "/settings.php", indicators: []string{"database", "password", "username", "host"}},
 	}
 
-	parsedURL, err := url.Parse(us.target)
+	baseURL, err := getBaseURL(us.target)
 	if err != nil {
 		return
 	}
 
-	baseURL := parsedURL.Scheme + "://" + parsedURL.Host
-
-	for _, path := range sensitivePaths {
-		testURL := baseURL + path
-		
-		resp, err := us.httpClient.Get(testURL)
+	for _, rule := range rules {
+		testURL := baseURL + rule.path
+		resp, body, err := us.fetchResponse(testURL)
 		if err != nil {
 			continue
 		}
-		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			continue
+		}
 
-		if resp.StatusCode == 200 {
-			result := UnauthResult{
-				URL:        testURL,
-				Path:       path,
-				Type:       "Sensitive File Exposure",
-				StatusCode: resp.StatusCode,
-				Evidence:   "敏感文件可直接访问",
-				Severity:   "High",
-				Confirmed:  false,
-			}
-			us.results = append(us.results, result)
-			fmt.Printf("⚠️  发现敏感文件: %s\n", testURL)
+		bodyLower := strings.ToLower(body)
+		if !containsAny(bodyLower, rule.indicators) {
+			continue
+		}
+
+		result := UnauthResult{
+			URL:        testURL,
+			Path:       rule.path,
+			Type:       "Sensitive File Exposure",
+			StatusCode: resp.StatusCode,
+			Evidence:   "敏感文件可直接访问且内容包含敏感配置特征",
+			Severity:   "High",
+			Confirmed:  true,
+		}
+		us.results = append(us.results, result)
+		fmt.Printf("⚠️  发现敏感文件: %s\n", testURL)
+	}
+}
+
+func (us *UnauthScanner) fetchResponse(target string) (*http.Response, string, error) {
+	resp, err := us.httpClient.Get(target)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", err
+	}
+	return resp, string(body), nil
+}
+
+func getBaseURL(target string) (string, error) {
+	parsedURL, err := url.Parse(target)
+	if err != nil {
+		return "", err
+	}
+	return parsedURL.Scheme + "://" + parsedURL.Host, nil
+}
+
+func containsAny(body string, indicators []string) bool {
+	for _, indicator := range indicators {
+		if strings.Contains(body, strings.ToLower(indicator)) {
+			return true
 		}
 	}
+	return false
+}
+
+func looksLikeLoginPage(body string) bool {
+	loginIndicators := []string{
+		"login",
+		"sign in",
+		"signin",
+		"password",
+		"username",
+		"登录",
+		"密码",
+		"用户名",
+		"统一身份认证",
+		"cas",
+		"sso",
+	}
+	return containsAny(body, loginIndicators)
+}
+
+func looksLikePublicDoc(body string) bool {
+	docIndicators := []string{"documentation", "api doc", "swagger", "openapi", "redoc"}
+	return containsAny(body, docIndicators)
+}
+
+func isPublicDocumentationPath(path string) bool {
+	return strings.Contains(path, "swagger") || strings.Contains(path, "api-docs")
 }
 
 func (us *UnauthScanner) GetResults() []UnauthResult {

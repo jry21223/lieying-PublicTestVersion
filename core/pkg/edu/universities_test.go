@@ -22,18 +22,18 @@ func TestGetByLevel(t *testing.T) {
 	db := NewUniversityDB()
 
 	// 测试985高校
-	985Unis := db.GetByLevel("985")
-	if len(985Unis) == 0 {
+	unis985 := db.GetByLevel("985")
+	if len(unis985) == 0 {
 		t.Error("No 985 universities found")
 	}
-	t.Logf("Found %d 985 universities", len(985Unis))
+	t.Logf("Found %d 985 universities", len(unis985))
 
 	// 测试211高校
-	211Unis := db.GetByLevel("211")
-	if len(211Unis) == 0 {
+	unis211 := db.GetByLevel("211")
+	if len(unis211) == 0 {
 		t.Error("No 211 universities found")
 	}
-	t.Logf("Found %d 211 universities", len(211Unis))
+	t.Logf("Found %d 211 universities", len(unis211))
 }
 
 func TestGetByProvince(t *testing.T) {

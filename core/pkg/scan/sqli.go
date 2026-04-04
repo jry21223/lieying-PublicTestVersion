@@ -16,13 +16,19 @@ type SQLiScanner struct {
 }
 
 type SQLiResult struct {
-	URL         string
-	Parameter   string
-	Type        string
-	Payload     string
-	Evidence    string
-	Severity    string
-	Confirmed   bool
+	URL       string
+	Parameter string
+	Type      string
+	Payload   string
+	Evidence  string
+	Severity  string
+	Confirmed bool
+}
+
+type responseSnapshot struct {
+	body       string
+	statusCode int
+	duration   time.Duration
 }
 
 func NewSQLiScanner(target string) *SQLiScanner {
@@ -63,19 +69,19 @@ func (ss *SQLiScanner) testErrorBased() {
 	}
 
 	errorPatterns := []string{
-		"SQL syntax",
+		"sql syntax",
 		"mysql_fetch",
 		"mysql_num_rows",
-		"ORA-",
-		"Oracle error",
-		"Microsoft OLE DB Provider",
-		"ODBC SQL Server Driver",
-		"SQLServer JDBC Driver",
-		"PostgreSQL query failed",
+		"ora-",
+		"oracle error",
+		"microsoft ole db provider",
+		"odbc sql server driver",
+		"sqlserver jdbc driver",
+		"postgresql query failed",
 		"pg_query",
 		"sqlite_query",
-		"SQLite/JDBCDriver",
-		"System.Data.SQLite",
+		"sqlite/jdbcdriver",
+		"system.data.sqlite",
 	}
 
 	parsedURL, err := url.Parse(ss.target)
@@ -83,28 +89,24 @@ func (ss *SQLiScanner) testErrorBased() {
 		return
 	}
 
+	baseline, err := ss.fetchSnapshot(ss.target)
+	if err != nil {
+		return
+	}
+	baselineLower := strings.ToLower(baseline.body)
+
 	query := parsedURL.Query()
 	for param := range query {
 		for _, payload := range errorPayloads {
-			testURL := ss.target
-			if strings.Contains(testURL, "?") {
-				testURL = strings.Replace(testURL, param+"="+query.Get(param), param+"="+url.QueryEscape(payload), 1)
-			}
-
-			resp, err := ss.httpClient.Get(testURL)
+			testURL := replaceQueryParam(ss.target, param, query.Get(param), payload)
+			snapshot, err := ss.fetchSnapshot(testURL)
 			if err != nil {
 				continue
 			}
 
-			body, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				continue
-			}
-
-			bodyStr := string(body)
+			bodyLower := strings.ToLower(snapshot.body)
 			for _, pattern := range errorPatterns {
-				if strings.Contains(bodyStr, pattern) {
+				if strings.Contains(bodyLower, pattern) && !strings.Contains(baselineLower, pattern) {
 					result := SQLiResult{
 						URL:       testURL,
 						Parameter: param,
@@ -112,7 +114,7 @@ func (ss *SQLiScanner) testErrorBased() {
 						Payload:   payload,
 						Evidence:  pattern,
 						Severity:  "High",
-						Confirmed: false,
+						Confirmed: true,
 					}
 					ss.results = append(ss.results, result)
 					fmt.Printf("⚠️  发现SQL注入: %s (参数: %s)\n", testURL, param)
@@ -139,36 +141,46 @@ func (ss *SQLiScanner) testTimeBased() {
 		return
 	}
 
+	baseline, err := ss.fetchSnapshot(ss.target)
+	if err != nil {
+		return
+	}
+
 	query := parsedURL.Query()
 	for param := range query {
 		for _, tp := range timePayloads {
-			testURL := ss.target
-			if strings.Contains(testURL, "?") {
-				testURL = strings.Replace(testURL, param+"="+query.Get(param), param+"="+url.QueryEscape(tp.Payload), 1)
-			}
-
-			start := time.Now()
-			resp, err := ss.httpClient.Get(testURL)
+			testURL := replaceQueryParam(ss.target, param, query.Get(param), tp.Payload)
+			snapshot, err := ss.fetchSnapshot(testURL)
 			if err != nil {
 				continue
 			}
-			resp.Body.Close()
-			elapsed := time.Since(start)
 
-			if elapsed > tp.Delay {
-				result := SQLiResult{
-					URL:       testURL,
-					Parameter: param,
-					Type:      "Time-based SQL Injection",
-					Payload:   tp.Payload,
-					Evidence:  fmt.Sprintf("响应时间: %v", elapsed),
-					Severity:  "High",
-					Confirmed: false,
-				}
-				ss.results = append(ss.results, result)
-				fmt.Printf("⚠️  发现SQL注入: %s (参数: %s)\n", testURL, param)
-				return
+			delta := snapshot.duration - baseline.duration
+			if delta < 4*time.Second {
+				continue
 			}
+
+			confirmSnapshot, err := ss.fetchSnapshot(testURL)
+			if err != nil {
+				continue
+			}
+			confirmDelta := confirmSnapshot.duration - baseline.duration
+			if confirmDelta < 4*time.Second {
+				continue
+			}
+
+			result := SQLiResult{
+				URL:       testURL,
+				Parameter: param,
+				Type:      "Time-based SQL Injection",
+				Payload:   tp.Payload,
+				Evidence:  fmt.Sprintf("响应时间差: %v", delta),
+				Severity:  "High",
+				Confirmed: true,
+			}
+			ss.results = append(ss.results, result)
+			fmt.Printf("⚠️  发现SQL注入: %s (参数: %s)\n", testURL, param)
+			return
 		}
 	}
 }
@@ -187,46 +199,86 @@ func (ss *SQLiScanner) testBooleanBased() {
 		return
 	}
 
+	baseline, err := ss.fetchSnapshot(ss.target)
+	if err != nil {
+		return
+	}
+
 	query := parsedURL.Query()
 	for param := range query {
 		for _, bp := range boolPayloads {
-			trueURL := ss.target
-			falseURL := ss.target
-			if strings.Contains(trueURL, "?") {
-				trueURL = strings.Replace(trueURL, param+"="+query.Get(param), param+"="+url.QueryEscape(bp.True), 1)
-				falseURL = strings.Replace(falseURL, param+"="+query.Get(param), param+"="+url.QueryEscape(bp.False), 1)
-			}
+			trueURL := replaceQueryParam(ss.target, param, query.Get(param), bp.True)
+			falseURL := replaceQueryParam(ss.target, param, query.Get(param), bp.False)
 
-			trueResp, err := ss.httpClient.Get(trueURL)
+			trueSnapshot, err := ss.fetchSnapshot(trueURL)
 			if err != nil {
 				continue
 			}
-			trueBody, _ := io.ReadAll(trueResp.Body)
-			trueResp.Body.Close()
-
-			falseResp, err := ss.httpClient.Get(falseURL)
+			falseSnapshot, err := ss.fetchSnapshot(falseURL)
 			if err != nil {
 				continue
 			}
-			falseBody, _ := io.ReadAll(falseResp.Body)
-			falseResp.Body.Close()
 
-			if len(trueBody) != len(falseBody) {
-				result := SQLiResult{
-					URL:       trueURL,
-					Parameter: param,
-					Type:      "Boolean-based SQL Injection",
-					Payload:   bp.True,
-					Evidence:  fmt.Sprintf("True响应长度: %d, False响应长度: %d", len(trueBody), len(falseBody)),
-					Severity:  "High",
-					Confirmed: false,
-				}
-				ss.results = append(ss.results, result)
-				fmt.Printf("⚠️  发现SQL注入: %s (参数: %s)\n", trueURL, param)
-				return
+			trueDelta := absInt(len(trueSnapshot.body) - len(baseline.body))
+			falseDelta := absInt(len(falseSnapshot.body) - len(baseline.body))
+			if baseline.statusCode != trueSnapshot.statusCode || baseline.statusCode != falseSnapshot.statusCode {
+				continue
 			}
+			if trueDelta > 10 {
+				continue
+			}
+			if falseDelta < 30 || absInt(len(trueSnapshot.body)-len(falseSnapshot.body)) < 30 {
+				continue
+			}
+
+			result := SQLiResult{
+				URL:       trueURL,
+				Parameter: param,
+				Type:      "Boolean-based SQL Injection",
+				Payload:   bp.True,
+				Evidence:  fmt.Sprintf("Baseline响应长度: %d, True响应长度: %d, False响应长度: %d", len(baseline.body), len(trueSnapshot.body), len(falseSnapshot.body)),
+				Severity:  "High",
+				Confirmed: true,
+			}
+			ss.results = append(ss.results, result)
+			fmt.Printf("⚠️  发现SQL注入: %s (参数: %s)\n", trueURL, param)
+			return
 		}
 	}
+}
+
+func (ss *SQLiScanner) fetchSnapshot(target string) (responseSnapshot, error) {
+	start := time.Now()
+	resp, err := ss.httpClient.Get(target)
+	if err != nil {
+		return responseSnapshot{}, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return responseSnapshot{}, err
+	}
+
+	return responseSnapshot{
+		body:       string(body),
+		statusCode: resp.StatusCode,
+		duration:   time.Since(start),
+	}, nil
+}
+
+func replaceQueryParam(target, param, originalValue, payload string) string {
+	if !strings.Contains(target, "?") {
+		return target
+	}
+	return strings.Replace(target, param+"="+originalValue, param+"="+url.QueryEscape(payload), 1)
+}
+
+func absInt(value int) int {
+	if value < 0 {
+		return -value
+	}
+	return value
 }
 
 func (ss *SQLiScanner) GetResults() []SQLiResult {

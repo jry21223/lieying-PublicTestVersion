@@ -214,7 +214,7 @@ func (e *NetworkEngine) DoRequest(ctx context.Context, req *Request) (*Response,
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 	if err != nil {
-		response.Error = fmt.Sprintf("failed to read response body: %w", err)
+		response.Error = fmt.Sprintf("failed to read response body: %v", err)
 		return response, err
 	}
 	response.Body = string(body)
