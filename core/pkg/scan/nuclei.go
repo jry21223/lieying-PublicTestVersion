@@ -86,9 +86,16 @@ func (ns *NucleiScanner) Scan() ([]NucleiResult, error) {
 	}
 
 	args := []string{
-		"-json",
+		"-j",
 		"-o", ns.outputFile,
 		"-severity", strings.Join(ns.severity, ","),
+		"-c", "25",
+		"-rate-limit", "100",
+		"-bulk-size", "25",
+		"-timeout", "5",
+		"-retries", "1",
+		"-stats",
+		"-stats-interval", "5",
 	}
 
 	if len(ns.templates) > 0 {

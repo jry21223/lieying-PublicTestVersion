@@ -13,10 +13,28 @@
 **原项目**: [xyz-1008/lieying-PublicTestVersion](https://github.com/xyz-1008/lieying-PublicTestVersion)
 
 **本项目在原项目基础上进行了以下改进**:
-- 重构为 CLI 工具，支持命令行操作
-- 使用 Cobra 框架，提供更好的命令行体验
+
+#### CLI 工具重构
+- 重构为纯 CLI 工具，移除前端依赖，更轻量高效
+- 使用 Cobra 框架，提供更好的命令行体验和参数解析
 - 支持多种 LLM 后端 (Ollama/OpenAI/DeepSeek)
-- 添加 Nuclei 漏洞扫描集成
+
+#### 扫描功能增强
+- **批量扫描**: 支持从 JSON 文件批量读取目标 (`-i` 参数)，可无缝对接 recon 输出
+- **存活验证**: 集成 httpx 在扫描前验证目标存活，大幅降低无效请求
+- **Nuclei v3**: 兼容 Nuclei v3 参数 (`-j`, `-stats`, `-bulk-size`)，支持批量高效扫描
+- **共享工具库**: 统一的 HTTP 客户端、严重等级常量、工具函数，消除代码重复
+
+#### 子域名枚举优化
+- **专业工具集成**: 优先使用 subfinder 进行被动子域名枚举（多源聚合）
+- **存活验证**: 使用 httpx 验证子域名存活状态，自动过滤无效域名
+- **泛解析检测**: 自动检测 DNS 泛解析，避免产生大量假阳性
+- **中国域名支持**: 正确识别 `.edu.cn`, `.gov.cn` 等特殊顶级域
+
+#### 工作流优化
+- **一键流程**: `recon` → `scan -i` 实现信息收集到漏洞扫描的无缝衔接
+- **进度显示**: Nuclei 扫描实时显示进度统计
+- **结果分组**: 按目标分组展示扫描结果，更易阅读
 
 ### 功能特性
 
@@ -172,8 +190,36 @@ lieying config --set network.timeout --value 60
 
 | 工具 | 说明 | 安装 |
 |------|------|------|
-| Nuclei | 漏洞扫描模板 | `go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest` |
+| Nuclei | 漏洞扫描模板引擎 | `go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest` |
+| subfinder | 被动子域名枚举 | `go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest` |
+| httpx | HTTP 存活验证 | `go install github.com/projectdiscovery/httpx/cmd/httpx@latest` |
 | Ollama | 本地 LLM 运行 | [ollama.com](https://ollama.com) |
+
+**推荐安装**:
+```bash
+# 一键安装 ProjectDiscovery 工具链
+go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+go install github.com/projectdiscovery/httpx/cmd/httpx@latest
+
+# 更新 Nuclei 模板
+nuclei -ut
+```
+
+### 一键渗透测试流程
+
+```bash
+# 1. 信息收集（使用 subfinder+httpx 获取真实存活子域名）
+lieying recon henu.edu.cn -o recon_result.json
+
+# 2. 批量漏洞扫描（使用 Nuclei 对 recon 输出的目标进行扫描）
+lieying scan -i recon_result.json -o scan_result.json
+
+# 3. 查看结果
+cat scan_result.json | jq '.results[] | {host: .host, severity: .info.severity, name: .info.name}'
+```
+
+> **注意**: Nuclei 现用于漏洞扫描（scan 命令），子域名枚举改用更专业的 subfinder + httpx 组合
 
 ### 项目结构
 
@@ -224,10 +270,28 @@ Lieying Penetration Testing Platform CLI Version is a professional penetration t
 **Original Project**: [xyz-1008/lieying-PublicTestVersion](https://github.com/xyz-1008/lieying-PublicTestVersion)
 
 **Improvements made in this version**:
-- Refactored as a CLI tool with command-line interface
-- Built with Cobra framework for better CLI experience
+
+#### CLI Tool Refactoring
+- Refactored as pure CLI tool, removed frontend dependencies for lighter footprint
+- Built with Cobra framework for better CLI experience and parameter parsing
 - Support for multiple LLM backends (Ollama/OpenAI/DeepSeek)
-- Integrated Nuclei vulnerability scanning
+
+#### Scanning Enhancements
+- **Batch Scanning**: Support reading targets from JSON files (`-i` parameter), seamless integration with recon output
+- **Alive Verification**: Integrated httpx to verify target availability before scanning, reducing invalid requests
+- **Nuclei v3**: Compatible with Nuclei v3 parameters (`-j`, `-stats`, `-bulk-size`), efficient batch scanning
+- **Shared Utilities**: Unified HTTP client, severity constants, and utility functions, eliminating code duplication
+
+#### Subdomain Enumeration Optimization
+- **Professional Tool Integration**: Prioritize subfinder for passive subdomain enumeration (multi-source aggregation)
+- **Alive Verification**: Use httpx to verify subdomain availability, automatically filter invalid domains
+- **Wildcard Detection**: Automatic DNS wildcard detection to avoid massive false positives
+- **Chinese Domain Support**: Correctly identify special TLDs like `.edu.cn`, `.gov.cn`
+
+#### Workflow Optimization
+- **One-click Workflow**: `recon` → `scan -i` for seamless information gathering to vulnerability scanning
+- **Progress Display**: Real-time progress statistics during Nuclei scanning
+- **Result Grouping**: Display scan results grouped by target for better readability
 
 ### Features
 
